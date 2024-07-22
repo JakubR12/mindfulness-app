@@ -1,0 +1,816 @@
+---
+title: "Data Preprocessing"
+author: "Jakub Raszka"
+date: "22 7 2024"
+output: word_document
+---
+## Packages & Functiions
+```{r setup, include=FALSE}
+#### Packages ####
+
+# set wd
+setwd("~/Documents/mindfulness-app")
+
+# instal packages for loading
+install.packages(pacman)
+library(pacman)
+
+# loading packages
+p_load(
+  tidyverse,
+  ggplot2,
+  psych,
+  hms,
+  data.table,
+  lubridate,
+  DescTools,
+  fitdistrplus,
+  lme4,
+  pubh,
+  tictoc,
+  purrr,
+  knitr
+)
+
+#### functions ####
+
+## !intersect
+outersect <- function(x, y, ...) {
+  big.vec <- c(x, y, ...)
+  duplicates <- big.vec[duplicated(big.vec)]
+  setdiff(big.vec, unique(duplicates))
+}
+
+##  %!in%
+"%!in%"  <- Negate("%in%")
+
+## making a fuction which replaces content variable in specific courseId
+content_modifier <- function(course_id, original, desired, dataM){
+
+  dataM$content <- with(dataM,
+     ifelse(content == original,
+            ifelse(courseId == course_id, desired, dataM$content), dataM$content)
+     )
+  return(dataM)
+}
+```
+
+## Loading data
+```{r}
+#### Data of 19 classes ####
+data_path <- "raw_data/Data_thesis/"
+files <- dir(data_path, pattern = "*.csv")
+
+mindful_data <- files %>% 
+  map(~ read_delim(file.path(data_path, .), delim = "\t", show_col_types = FALSE)) %>% 
+  reduce(rbind)
+
+#### Data of durations of recordings, week number and teacher id ####
+ 
+# content type/type of practice
+record_data <- read_delim("raw_data_modified/Copy of Student_descriptions_2509.csv", delim = ";", show_col_types = FALSE)
+record_data[,c("X4", "X5", "record_duration")] <- NULL
+
+# prescribed duration of recordings
+record_data_dur <- read.delim("raw_data_modified/Record_duration_good_format.txt", header = F)
+colnames(record_data_dur) <- "duration"
+
+# teacher id
+teacher_id_data <- read_delim("raw_data_modified/Teacher_id_course_id.csv", delim = ";", show_col_types = FALSE)
+teacher_id_data[c("X3", "X4", "X5")] <- NULL
+
+# week number
+week_n <- read_delim("raw_data_modified/Correct_week_number.csv", delim = ";", show_col_types = FALSE)
+
+#### Manual adjustments ####
+## adding zero at the begining of two id course
+week_n$courseId <- ifelse(week_n$courseId == 21626, sprintf("%06d", 021626), week_n$courseId)
+week_n$courseId <- ifelse(week_n$courseId == 66437, sprintf("%06d", 066437), week_n$courseId)
+
+
+## renaming column to match other data frames
+names(week_n)[names(week_n) == "cor_week_number"] <- "week_number_c"
+
+#### Demo data ####
+# loading demo data
+data_path_demo <- "raw_data/Demographics_students/"
+files_demo <- dir(data_path_demo, pattern = "*.csv")
+
+data_demo <- files_demo %>% 
+  map(~ read_delim(file.path(data_path_demo, .), delim = "\t", show_col_types = FALSE)) %>% 
+  reduce(rbind)
+
+```
+
+## Merge data
+```{r}
+# merging content, prescribed duration of practice
+record_data <- cbind(record_data, record_data_dur)
+
+#changing duration to a date class
+record_data$duration <- ms(record_data$duration)
+
+
+## splitting multiple course values per content
+record_data <- separate_rows(record_data,courseId,sep="[[:space:]]")
+
+# merging teacher id and content, duration
+record_data <- merge(teacher_id_data, record_data)
+
+## excluding courseId of CCT and one tutorial (diabetis), not supposed to be part of analysis!
+record_data <- dplyr::filter(record_data, courseId != 643761 & courseId != 545252
+ & courseId != 864491)
+
+## keep only desired columns # has to do that also for super_df_timer later on
+#record_data <- record_data %>% select(c("courseId", "teacherId", "Content", "duration"))
+```
+
+
+
+## Various formats of data
+```{r}
+##using lubridate package to change the format of the start and end time
+mindful_data$startTime <- ymd_hms(mindful_data$startTime)
+mindful_data$endTime <- ymd_hms(mindful_data$endTime)
+
+# extracting a weekday name i
+## since I am on non-english computer
+Sys.setlocale("LC_TIME", "C")
+
+mindful_data$weekday <- lubridate::wday(mindful_data$startTime, label = TRUE, abbr = FALSE)# locale = Sys.setlocale(category = "LC_ALL", locale = "English"))
+
+
+# calculating the inaccurate duration from start and end of session
+mindful_data$duration_start_end <- mindful_data$endTime - mindful_data$startTime
+
+
+# extracting weekday and weekend
+mindful_data$day_type <- ifelse(mindful_data$weekday == "Saturday" | mindful_data$weekday == "Sunday", "weekend", "weekday")
+```
+
+
+Multiple problems with value consistency found, namely in column courseId and content. In courseId, one value had space at the begining, two others missed zero at the begining.
+We found more inconsistencies in the content. Several spaces at the end of variable (only in mindful_data), capital letters at words' begining used interchangeably and the list goes on...
+
+
+
+## Format inconsistencies
+```{r}
+#### mindful dataset ####
+
+## lowercase content
+mindful_data$content <- tolower(mindful_data$content)
+
+## removing space at the end or beginning
+mindful_data$content <- trimws(mindful_data$content)
+
+## "Body Scan" -> "Bodyscan"
+mindful_data$content <- ifelse(mindful_data$content == "body scan", "bodyscan", mindful_data$content)
+
+## two version of Kor meditation
+mindful_data$content[grepl("kort meditation", mindful_data$content)] <- "kort meditation andedraet og krop"
+
+## eliminating danish special punctuation
+mindful_data$content[grepl("k og siddende meditation", mindful_data$content)] <- "staende straek og siddende meditation"
+
+## renaming correctly named sesion for course Id 710798
+mindful_data <- content_modifier(710798, "liggende yoga", "lang liggende yoga", mindful_data)
+
+
+#### record data  ####
+
+## renaming content name for the sake of consistency
+
+if("Content" %in% colnames(record_data)){
+  
+ record_data <- record_data %>% 
+   dplyr::rename("content" = "Content") 
+}
+
+
+## lowercase content
+record_data$content <- tolower(record_data$content)
+
+## removing space at the end or beginning
+record_data$content <- trimws(record_data$content)
+
+
+## two versions of Kort meditation
+record_data$content[grepl("kort meditation", record_data$content)] <- "kort meditation andedraet og krop"
+
+## unify different versions of body scan
+record_data$content <- ifelse(record_data$content == "body scan", "bodyscan", record_data$content)
+
+## eliminating danish special punctuation
+record_data$content[grepl("k og siddende meditation", record_data$content)] <- "staende straek og siddende meditation"
+
+
+
+##  adding missing zero at the begining of two courseId
+record_data$courseId <- ifelse(record_data$courseId == 21626, sprintf("%06d", 021626), record_data$courseId)
+
+record_data$courseId <- ifelse(record_data$courseId == 66437, sprintf("%06d", 066437), record_data$courseId)
+
+## 710798 missing one combination of course id and content in record_data -> adding it manually
+record_data <- record_data %>% 
+  add_row(courseId = "710798", teacherId = 1, content = "staende straek og siddende meditation", duration = ms("49:28"))
+
+
+#### unyfying practise type into 3 categories  ####
+
+mindful_data <- mindful_data %>%
+  dplyr::mutate(practice_type = case_when(
+    grepl("scan", content) ~ "bodyscan",
+    grepl("yoga", content) ~ "yoga",
+    grepl("musik|loving kindness.|og.krop|meditation", content) ~ "meditation"
+  ))
+
+```
+
+## CourseId stats
+
+```{r}
+# number of classes, sd, mean
+mindful_data %>% group_by(courseId) %>% dplyr::summarise(n = n_distinct(studentId)) %>% describe(.)
+```
+
+
+## Calculating duration from start time and progress, merging
+
+```{r}
+#### Merge ####
+# merging dataframe
+super_df <- merge(record_data, mindful_data, by = c("content", "courseId"), all.y = T)
+
+
+# getting duration for timer (from start_time_duration)
+
+## calculating duration based on progress and recording duration
+super_df$duration <- as.numeric(super_df$duration)
+super_df$recording_duration <- super_df$duration
+
+
+## calculation
+super_df$duration <- super_df$progress/100*super_df$recording_duration
+super_df$duration <- round(super_df$duration, digits = 0)
+
+
+
+#### aligning duration formats ####
+
+super_df$duration_start_end <- super_df$endTime - super_df$startTime
+super_df$duration_start_end <- as.numeric(super_df$duration_start_end)
+
+
+## replacing NA in content with timer
+super_df$content[is.na(super_df$content)]  <- "timer"
+
+
+## replacing NA values
+
+super_df$duration <- ifelse(is.na(super_df$duration), super_df$duration_start_end, super_df$duration)
+super_df$content[is.na(super_df$content)]  <- "timer"  
+super_df$practice_type[is.na(super_df$practice_type)]  <- "timer"  
+super_df$teacherId[is.na(super_df$teacherId)]  <- 0  
+super_df$recording_duration[is.na(super_df$recording_duration)]  <- 0 
+
+## extracting unique number for a day
+super_df$ymd_numeric <- as.numeric(date(super_df$startTime))
+
+
+## creating a teach id with correct courseIds
+teacher_id_data_timer <- teacher_id_data
+
+teacher_id_data_timer$courseId <- 
+  ifelse(teacher_id_data_timer$courseId == 21626, sprintf("%06d", 021626), teacher_id_data_timer$courseId)
+teacher_id_data_timer$courseId <- 
+  ifelse(teacher_id_data_timer$courseId == 66437, sprintf("%06d", 066437), teacher_id_data_timer$courseId)
+
+
+## getting full info for "timer" data as well (not working because of no info for content column)
+super_df_timer <- super_df %>% dplyr::filter(type == "timer") %>% 
+  dplyr::select(-c("teacherId")) %>% 
+  merge(teacher_id_data_timer)
+
+## deleting "merging" columns with no sense
+#super_df_time <- super_df_timer[,1:16]
+
+## merging complete timer and no-timer data
+super_df <- super_df %>% filter(type != "timer") %>% 
+  add_row(super_df_timer)
+
+#### exclusion CHART-FLOW ####
+nrow(super_df)
+n_distinct(super_df$studentId)
+```
+
+
+## Data exclusion
+```{r}
+# deleting progress >100  & duration <119 and duration > 4000
+
+super_df <- filter(super_df, progress <=100 & duration >= 119 & duration < 4000)
+
+# deleting randomly created NA columns with no fuction
+super_df <- select(super_df, -contains("."))
+
+# deleting NA values
+## viewing what is to be deleted
+super_df %>% filter_all(any_vars(is.na(.))) 
+
+## deleting
+super_df <- na.omit(super_df)
+
+#### exclusion CHART-FLOW ####
+nrow(super_df)
+n_distinct(super_df$studentId)
+## excluded
+18877 - nrow(super_df)
+
+# participant calculation
+346 - n_distinct(super_df$studentId)
+
+# exlusion of "too long" sessions - 14 in total, some of them wouldn`t make it through next cleaning steps anyway
+```
+
+
+## Subsequences loop
+
+Assumptions that the loop makes:
+- progress is not corrupt and was functioning during the entire mindfulness program
+- overlapping sessions: if the progress is growing during the same day, it is the same session/observation split into multiple sessions/observations (due to an interruption, for instance) and therefore only the one with the highest progress within one subsequence (sessions with growing progress) counts 
+- people were honestly and fully engaging with their practices during the entire recording duration 
+
+```{r}
+#### List to iterate over with the loop ####
+# Get all student and day combinations with more than 1 session
+super_df_comb <- super_df %>%
+  group_by(studentId, ymd_numeric) %>%
+  dplyr::summarise(freq = n()) %>%
+  dplyr::filter(freq > 1)
+
+# Precise number of sessions from the days with more than 1 session 
+sum(super_df_comb$freq)
+
+# List to store the cleaned data (after running the loop)
+indices <- list()
+
+# Results list iterator
+list_iter <- 1
+
+#### Loop ####
+# Loop for dealing with overlapping sessions and the build-up issue with progress
+
+## loop for finding subsequences and keeping only one session with the highest progress per subsequence
+
+for (i in seq(nrow(super_df_comb))) {
+  one_combination <- super_df_comb[i, ] 
+  
+  # filter all sessions per one day per participant and arrange it by the start time and progress
+  df_day <- super_df %>%
+    filter(
+      studentId == one_combination$studentId,
+      ymd_numeric == one_combination$ymd_numeric) %>%
+    arrange(startTime, progress)
+
+  # finding indices of sessions´ subsequences per student per day
+  # example: https://stackoverflow.com/questions/55515798/find-all-subsequences-with-specific-length-in-sequence-of-numbers-in-r
+  indices_loop <- sapply(split(1:length(df_day$progress),
+                                cumsum(c(
+                                  0, (diff(df_day$progress)
+                                ) + 1) < 1)), # change from <1 to <=1?
+                          function(x)
+                            if (length(df_day$progress) >= 2)
+                              c(start = x[1], end = x[length(x)]))
+  
+ 
+  indices_loop <- as.data.frame(t(indices_loop))
+  
+  # for every group of subsequences filter only the session with the highest progress
+  for (i in 1:nrow(indices_loop)) {
+    start <- indices_loop[i, 1]
+    end <-  indices_loop[i, 2]
+    
+    df <- df_day[start:end, ]
+    df <- df %>% arrange(desc(progress)) %>% head(1)
+    
+    # appending the cleaned subsequences to the list
+    indices[[list_iter]] <- df
+    list_iter <- list_iter + 1 
+    
+  }
+}
+
+# unlisting the cleaned subsequences list
+indices_df <- do.call("rbind", indices)
+
+#indices_df <- NULL
+## adding the observations with 1 session per day per student to the cleaned subsequences dataframe (multiple sessions per student per day)
+clean_df <- super_df %>%
+  group_by(studentId, ymd_numeric) %>%
+  dplyr::mutate(n_session_per_day = n()) %>%
+  dplyr::filter(n_session_per_day == 1) %>%
+  full_join(indices_df)
+
+clean_df %>%
+  group_by(studentId, ymd_numeric) %>%
+  dplyr::mutate(n_session_per_day = n()) %>%
+  #dplyr::filter(n_session_per_day == 2) %>%
+  group_by(studentId) %>%
+  dplyr::summarise(n_session = n()) 
+
+#### Loop check ####
+# Examples with separate students to confirm that the cleaning worked
+
+super_df %>%
+  filter(studentId == "181087" & ymd_numeric == 18338) %>%
+  arrange(startTime)
+
+clean_df %>%
+  filter(studentId == "015365" & ymd_numeric == 18299) %>% 
+  arrange(startTime)
+
+
+super_df %>%
+  filter(studentId == "245558" & ymd_numeric == 18391) %>% 
+  arrange(startTime)
+
+clean_df %>%
+  filter(studentId == "245558" & ymd_numeric == 18391) %>% 
+  arrange(startTime)
+
+
+#### exclusion CHART-FLOW ####
+nrow(clean_df)
+n_distinct(clean_df$studentId)
+15037-10730
+
+```
+
+
+
+## Creating variables
+
+#### Day period
+```{r}
+fulldata_clean <- clean_df
+
+# changing format
+fulldata_clean$hms_startTime <- as.numeric(as_hms(fulldata_clean$startTime))
+
+# empty vector
+fulldata_clean$day_period <- c("l")
+
+## making the day period
+for(i in 1:nrow(fulldata_clean)){
+  
+  if(fulldata_clean$hms_startTime[i] < 18000){
+    fulldata_clean$day_period[i] <- "night"
+    
+    } else if(fulldata_clean$hms_startTime[i] >= 18000 & fulldata_clean$hms_startTime[i] < 43200){
+     fulldata_clean$day_period[i] <- "morning"  
+    
+    } else if(fulldata_clean$hms_startTime[i] >= 43200 & fulldata_clean$hms_startTime[i] < 61200){
+     fulldata_clean$day_period[i] <- "afternoon"  
+     
+    } else(fulldata_clean$day_period[i] <- "evening")
+  }
+
+
+```
+
+
+### Exclusion beyond MBSR
+```{r}
+#### Reload data ####
+# loading week number data (the reason for doing it here is that when we re-run the code, the date format of some columns changes, so we need to re-load the data to keep it in the original form whenever re-running the code)
+
+# week number
+week_n <- read_delim("raw_data_modified/Correct_week_number.csv", delim = ";")
+
+## adding zero at the begining of two id course
+week_n$courseId <- ifelse(week_n$courseId == 21626, sprintf("%06d", 021626), week_n$courseId)
+week_n$courseId <- ifelse(week_n$courseId == 66437, sprintf("%06d", 066437), week_n$courseId)
+
+## renaming column to match other data frames
+names(week_n)[names(week_n) == "cor_week_number"] <- "week_number_c"
+
+#### Loop ####
+### making end time column for looping
+
+## changing into right format
+week_n$week_start <- as.Date(dmy(week_n$week_start))
+
+
+
+# empty column for loop output
+week_n$week_end <- as.Date("")
+
+for(i in 1:nrow(week_n)){
+  if(week_n$week_number_c[i] <= 7){
+   week_n$week_end[i] <- week_n$week_start[i+1] - 1 
+  
+   } else(week_n$week_end[i] <- week_n$week_start[i] + 6)
+  
+}
+
+# changing classes
+week_n$week_start <- as.Date(week_n$week_start)
+week_n$week_end <- as.Date(week_n$week_end)
+
+##### creating a sequence of all day between start and end time so we can merge it with session data
+
+# empty dataframe for the loop's output
+empty_df <- data.frame()
+
+#### Lopp for sequences ####
+##  creating sequence of week start and week end
+for(i in 1:nrow(week_n)){
+  day = seq.Date(week_n$week_start[i], week_n$week_end[i], by = 1)
+  
+  all = cbind(day, week_n$courseId[i], week_n$week_number_c[i])
+  empty_df <- rbind(empty_df, all)
+}
+
+# changing into the right format
+empty_df$day <- as.Date(as.numeric(empty_df$day), origin = "1970-01-01")
+
+
+## changing names         
+names(empty_df)[names(empty_df) == "V2"] <- "courseId"
+names(empty_df)[names(empty_df) == "V3"] <- "week_number_c"
+
+## adding a date variable for merging dataframes
+fulldata_clean$day <- as.Date(fulldata_clean$startTime)
+
+
+## merging -> deletion of sessions practiced beyond program!
+fulldata_clean <- merge(fulldata_clean, empty_df, by = c("courseId", "day"))
+
+
+fulldata_clean <- merge(fulldata_clean, week_n, by = c("courseId", "week_number_c"))
+
+
+#### exclusion CHART-FLOW ####
+nrow(fulldata_clean)
+n_distinct(fulldata_clean$studentId)
+10730-7996
+
+
+
+## save empty_df with start time and end 
+program_week_starend <- empty_df %>% group_by(courseId, week_number_c) %>% 
+  dplyr::summarise(program_week_start = min(day),
+                   program_week_end = max(day))
+
+#write_csv(program_week_starend, "created_data/program_week_start_end.csv")
+
+```
+
+
+
+
+#### Calendar week number
+```{r}
+
+# creating correct week start from the week start
+df7_horse <- fulldata_clean
+
+df7_horse$w_number_accurate <- NA
+df7_horse$week_start_accurate <- NA
+df7_horse$week_end_accurate <- NA
+
+df7_horse$day <- as.Date(df7_horse$day)
+df7_horse$week_start <- as.Date(df7_horse$week_start)
+
+list7_mink <- list()
+
+  
+for (i in levels(as.factor(df7_horse$studentId))){
+  W1 <- df7_horse[df7_horse$studentId == i,]
+  #print(unique(W1$studentId))
+  
+  program_start <- min(W1$week_start)
+  #print(program_start)
+  
+  
+  for (w in 1:nrow(W1)){
+    
+      ## W1
+    if(W1$day[w] %within% interval(program_start, (program_start + 6))){
+      
+      W1$w_number_accurate[w] <- 1
+      W1$week_start_accurate[w] <- program_start
+      W1$week_end_accurate[w] <- program_start + 6
+    
+      ## W2
+    } else if(W1$day[w] %within% interval((program_start + 7), (program_start + 13))){
+      
+      W1$w_number_accurate[w] <- 2
+      W1$week_start_accurate[w] <- program_start + 7
+      W1$week_end_accurate[w] <- program_start + 13  
+    
+      ## W3    
+    } else if(W1$day[w] %within% interval((program_start + 14), (program_start + 20))){
+      
+      W1$w_number_accurate[w] <- 3
+      W1$week_start_accurate[w] <- program_start + 14
+      W1$week_end_accurate[w] <- program_start + 20  
+    
+      ##  W4  
+    } else if(W1$day[w] %within% interval((program_start + 21), (program_start + 27))){
+      
+      W1$w_number_accurate[w] <- 4
+      W1$week_start_accurate[w] <- program_start + 21
+      W1$week_end_accurate[w] <- program_start + 27
+    
+      ## W5    
+    } else if(W1$day[w] %within% interval((program_start + 28), (program_start + 34))){
+      
+      W1$w_number_accurate[w] <- 5
+      W1$week_start_accurate[w] <- program_start + 28
+      W1$week_end_accurate[w] <- program_start + 34 
+    
+      ## W6    
+    } else if(W1$day[w] %within% interval((program_start + 35), (program_start + 41))){
+      
+      W1$w_number_accurate[w] <- 6
+      W1$week_start_accurate[w] <- program_start + 35
+      W1$week_end_accurate[w] <- program_start + 41 
+   
+       ## W7    
+    } else if(W1$day[w] %within% interval((program_start + 42), (program_start + 48))){
+      
+      W1$w_number_accurate[w] <- 7
+      W1$week_start_accurate[w] <- program_start + 42
+      W1$week_end_accurate[w] <- program_start + 48 
+    
+      ## W8    
+    } else if(W1$day[w] %within% interval((program_start + 49), (program_start +  55))){
+      
+      W1$w_number_accurate[w] <- 8
+      W1$week_start_accurate[w] <- program_start + 49
+      W1$week_end_accurate[w] <- program_start + 55 
+    
+      ## W9    
+    } else if(W1$day[w] %within% interval((program_start + 56), (program_start + 62))){
+      
+      W1$w_number_accurate[w] <- 9
+      W1$week_start_accurate[w] <- program_start + 56
+      W1$week_end_accurate[w] <- program_start + 62 
+    
+      ## W10   
+    } else if(W1$day[w] %within% interval((program_start + 63), (program_start + 69))){
+      
+      W1$w_number_accurate[w] <- 10
+      W1$week_start_accurate[w] <- program_start + 63
+      W1$week_end_accurate[w] <- program_start + 69 
+    
+      ## W11    
+    } else{
+      W1$w_number_accurate[w] <- 11
+      W1$week_start_accurate[w] <- program_start + 70
+      W1$week_end_accurate[w] <- program_start + 76 
+    }
+  }
+  list7_mink[[i]] <- W1
+}
+
+df7_mink <- do.call(rbind, list7_mink)
+
+rownames(df7_mink) <- NULL
+
+
+```
+
+
+#### binary covid participant & session level
+```{r}
+
+covid_bin <- data.frame()
+
+for(i in levels(as.factor(df7_mink$studentId))){
+ P2 <- df7_mink[df7_mink$studentId == i,]
+  
+  if(
+    min(P2$startTime) %within% interval(as.Date("2019-02-24"), as.Date("2020-02-29")) & 
+    max(P2$startTime) %within% interval(as.Date("2020-03-23"), as.Date("2020-07-29"))){
+  
+    P2$covid_period <- "yes"
+  
+    } else(P2$covid_period <- "no")
+ 
+ covid_bin <- rbind(covid_bin, P2)
+}
+
+## session level
+covid_bin$covid_session <- c()
+
+for(i in 1:nrow(covid_bin)){
+  
+  if(covid_bin$day[i] <= as.Date("2020-03-11")){
+    covid_bin$covid_session[i] <- "no"
+    
+    } else(covid_bin$covid_session[i] <- "yes")
+  }
+
+
+## excluding 1 session of on eparticipant who did practice 2 weeks after the end of 7th week because of holiday
+#covid_bin <- filter(covid_bin, week_number != 12)
+
+```
+
+
+## Check split sessions
+```{r}
+# duration >120 s & program weeek <=8
+covid_bin %>% 
+   filter(studentId == "245558" & ymd_numeric == 18352) %>% 
+  arrange(startTime)
+
+suspc_exam <- fulldata_clean %>%
+  filter(studentId == "831532" & ymd_numeric == 18028) %>% 
+  arrange(startTime)
+
+super_df %>%
+  filter(studentId == "831532" & ymd_numeric == 18028) %>% 
+  arrange(startTime)
+
+```
+
+
+## Data exclusion ITT
+```{r}
+# exclusion based on ITT (intention-to-treat concept) -> at least 3 session beyond first week
+
+## at least 1 session done in other week than 3rd
+IIT_list <- list()
+
+for (i in levels(as.factor(covid_bin$studentId))){
+  G1 <- covid_bin[covid_bin$studentId == i,]
+  
+  G1$n_session <- length(G1$studentId)
+  
+  G1$IIT <- ifelse(G1$n_session >=3 & max(G1$w_number_accurate >=2), 1, 0)
+  # if(G1$n_session >= 3 & max(G1$w_number_accurate) >= 2){
+  #   G1$IIT <- 1
+  #   
+  # } else{G1$IIT <- 0}
+  IIT_list[[i]] <- G1
+}
+
+IIT <- do.call("rbind", IIT_list)
+
+# removing strange row names
+rownames(IIT) <- NULL
+
+IIT <- IIT %>% filter(IIT == 1) # 289 participants out of 320
+
+length(unique(covid_bin$studentId))
+
+
+
+IIT %>% filter(IIT == 0) %>% summarise(count = length(unique(studentId)))
+
+working_df <- covid_bin %>% subset(studentId %in% IIT$studentId) 
+
+IIT %>% 
+  filter(IIT == 1) %>% 
+  group_by(studentId) %>% 
+  dplyr::summarise(sessionn = n()) %>% 
+  mutate(average_n_s= mean(sessionn)) %>% 
+  arrange(desc(sessionn))
+
+
+# adding gender column for analysing favourite practice in week 7,8
+working_df <- distinct(merge(working_df, data_demo[,c(2,4)], by = "studentId", all.x = T))
+
+
+# exclusion CHART-FLOW
+nrow(working_df)
+n_distinct(working_df$studentId)
+
+7996 - nrow(working_df)
+
+# adding program week start and end
+# merge(working_df, program_week_starend, by = c("week_number_c", "courseId")) no need to, it is already there
+
+```
+
+## Write data
+```{r}
+# sorting columns
+working_df <- working_df %>%
+  dplyr::mutate(program_week = week_number_c,
+                calendar_week = w_number_accurate) 
+
+
+# write down 8 PROGRAM WEEK DF
+#write_csv(working_df, "created_data/df_8_program_weeks.csv")
+
+# write down 6 PROGRAM WEEK DF
+working_df6 <- filter(working_df, week_number_c <= 6)
+
+#write_csv(working_df6, "created_data/df_6_program_weeks.csv")
+```
+

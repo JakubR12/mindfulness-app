@@ -1,0 +1,1122 @@
+---
+title: "Mindful Models J"
+author: "Jakub Raszka & Ruta Slivkate"
+date: "2024-07-22"
+output: html_document
+---
+
+Before the first run, check all packages as some of them require a manual installation. See comments for how-to \## Packages, functions
+
+```{r setup, include=FALSE}
+## packages
+# to instal rstan, visit https://github.com/stan-dev/rstan/wiki/RStan-Getting-Started
+# to instal Rtools, visit https://cran.r-project.org/bin/windows/Rtools/
+
+#### cmdstanr installation ####
+# we recommend running this is a fresh R session or restarting your current session
+# install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+# 
+# library(cmdstanr)
+# install_cmdstan(cores = 2, overwrite = T)
+
+
+#### RTOOLS for windows users needed to instal rstan#### 
+install.packages(pacman)
+pacman:: p_load(
+  tidyverse,
+  ggtext, # new lines for ggplot text using html code
+  psych,
+  hms,
+  brms, 
+  lubridate, 
+  bayesplot, 
+  viridis, # ggplot2 theme
+  fitdistrplus, 
+  plyr,
+  MASS, 
+  markovchain, 
+  igraph, 
+  ggraph, 
+  lme4, 
+  emmeans,
+  tidybayes,
+  gridExtra,
+  ggthemes,
+  AER, 
+  MASS,
+  DHARMa,
+  cmdstanr,
+  forcats,
+  marginaleffects,
+  ggpubr,
+  cowplot,
+  svglite) # creating .svg images) 
+
+## negating %in%
+`%!in%` = Negate(`%in%`)
+
+## function for weekday count
+count_weekdays<- Vectorize(function(from,to) sum(!wday(seq(from, to, "days")) %in% c(1,7)))
+
+## setting theme for bayesian plot
+#color_scheme_set("viridis")
+
+#### set working directory to project ####
+setwd("~/Documents/mindfulness-app")
+```
+
+## Data
+
+```{r}
+# load 8 PROGRAM WEEKS dataset
+df_w8 <-
+  read_csv(
+    "created_data/df_8_program_weeks.csv",
+    show_col_types = F,
+    col_select = c(
+      "courseId",
+      "studentId",
+      "teacherId",
+      "gender",
+      "duration",
+      "startTime",
+      #"stickiness_nopooling",
+      "day_period",
+      "program_week",
+      "calendar_week",
+      "content",
+      "progress",
+      "endTime",
+      "covid_period",
+      "covid_session",
+      "type",
+      "weekday",
+      "day_type",
+      "practice_type",
+      "recording_duration",
+      "ymd_numeric",
+      "week_start",
+      "week_end"
+    )
+  )
+
+## changing columns to factor
+factor_cols <- c("studentId","teacherId", "courseId", "covid_period", "day_period", "weekday", "day_type")
+
+df_w8[factor_cols] <- lapply(df_w8[factor_cols], as.factor)
+
+### Manual fix of a wrong entry####
+# student number 067858 in that time has wrong calendar/program week -> manual fix of program week from 6 to 7
+## do it
+df_w8$program_week[df_w8$studentId == "067858" & df_w8$calendar_week ==7 & df_w8$program_week == 6] <- 7
+## check
+df_w8 %>% 
+  dplyr::filter(
+  studentId == "067858" & calendar_week == 7 & program_week ==6)
+
+
+# 6 PROGRAMS WEEK
+df_w6 <- dplyr::filter(df_w8, program_week <= 6)
+
+# calculating program length for w6
+df_w6 <- df_w6 %>% 
+  group_by(courseId) %>% 
+  dplyr::mutate(
+    program_length = as.integer(case_when(
+      41 == max(week_end) - min(week_start) | 42 == max(week_end) - min(week_start)~ "6",
+      48 == max(week_end) - min(week_start) | 48 == max(week_end) - min(week_start)  ~ "7",
+      55 == max(week_end) - min(week_start) | 56 == max(week_end) - min(week_start) ~ "8",
+      62 == max(week_end) - min(week_start) | 63 == max(week_end) - min(week_start)~ "9"
+    ) ))
+```
+
+## Aim 1: Amount of Practice
+
+##### Stats
+
+```{r}
+
+#### 6 PROGRAM WEEKS WITH 0 SESSION WEEKS INCLUDED ####
+# decoupling program weeks consisting of more calendar weeks due to holiday weeks -> everyone as separate program week with different id
+tt <- df_w8 %>%
+  filter(program_week <= 6) %>%
+  group_by(studentId, program_week, calendar_week) %>%
+  dplyr::summarise(n_session = n(), studentId = as.character(studentId)) %>%
+  dplyr::summarise(
+    studentId_adj = as.character(ifelse(program_week != calendar_week, paste0(studentId, "00", calendar_week),studentId))) %>%
+  
+    group_by(studentId_adj, program_week) %>% 
+   dplyr::summarise(n_session = n())
+
+# how to "fabricate" zero sessions? -> count how many they are supposed to be
+
+df_w6 %>% dplyr::summarise(n = n_distinct(studentId))
+
+
+# given that in each week, there are 288 students practicing, how many students do not have a single session in a given (program) week?
+w6_templ <- df_w6 %>% group_by(program_week) %>% dplyr::summarise(n_stud_week = 288-n_distinct(studentId))
+
+
+## making df by hand - simulate data entry for 0 session weeks (studentId becomes messed up - cannot be traced up and modelled)
+studentId_adj <- c(11, 22,33,44,55,66)
+program_week <- c(1,2,3,4,5,6)
+n_session <- c(rep(0, 6))
+template <- data.frame(studentId_adj, program_week, n_session)
+
+template1 <- template[rep(1, w6_templ$n_stud_week[1]),]
+template2 <- template[rep(2, w6_templ$n_stud_week[2]),]
+template3 <- template[rep(3, w6_templ$n_stud_week[3]),]
+template4 <- template[rep(4, w6_templ$n_stud_week[4]),]
+template5 <- template[rep(5, w6_templ$n_stud_week[5]),]
+template6 <- template[rep(6, w6_templ$n_stud_week[6]),]
+
+w6_zero_aggr <- rbind(template1,template2, template3, template4, template5, template6)
+
+# bind with non zero data
+w6_zero_aggr <- 
+  w6_zero_aggr %>% dplyr::mutate(
+  studentId_adj = as.character(studentId_adj),
+  program_week = as.numeric(program_week),
+  n_session = as.integer(n_session)) %>% 
+  rbind(tt)
+
+
+
+#### GRAPH ####
+plot_amount <- w6_zero_aggr %>% 
+   # plot
+  ggplot(aes(factor(program_week), n_session, fill = program_week)) +
+  geom_violin(width = 1.2) +
+  geom_boxplot(notch = F, width=0.3, color="black", alpha = 0.2, varwidth = T) +
+   stat_summary(fun = mean, geom = "point", size = 2, color = "red", fill = "red") +
+  scale_fill_viridis() +
+  #ylim(0, 15) +
+  scale_y_continuous(breaks = c(seq(0, 16, by = 2))) + 
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 11),
+        plot.caption = element_markdown(hjust = 0),
+        panel.grid.major.x = element_blank()) +
+  ggtitle("") +
+  xlab("Week number") + 
+  ylab("Number of sessions") 
+  #ggsave("Amount of Practice", path = "plots/", device = pdf, dpi = 600)
+
+
+  labs(caption = "Figure 2 - The number of sessions participants recorded over the first 6 weeks of the MBSR programme,<br>
+       where there are assigned practices. Red dots represent the average number of sessions, <br>
+       while the black horizontal lines represent median numbers of sessions. <br>
+       There is conside A a grahp below shows how averages (red dots) and medians (black lines) vary by a week.")
+
+ggsave("Figure 3.pdf", plot_amount, path = "plots/", dpi = 600, height = 6, width = 9)
+ggsave("Figure 3.tiff", plot_amount, path = "plots/", dpi = 600, height = 6, width = 9)
+
+
+#####  6PW by week STAT ####
+ss <- w6_zero_aggr %>% 
+  group_by(program_week) %>% 
+  dplyr::summarise(
+    mean = mean(n_session),
+    median = median(n_session, na.rm = TRUE),
+    sd = sd(n_session, na.rm = TRUE),
+    min = min(n_session, na.rm = TRUE),
+    max = max (n_session, na.rm = TRUE))
+
+# STATS
+#describe(tt) # without zeros
+
+## n_session 6 PW
+w6_zero_aggr %>% # with zeroes!
+  describe(.)
+
+# average duration 6 PW
+describe(df_w6)[5,]/60
+
+
+#### completion rate ####
+
+# calculate program length in weeks
+cr_df_w6 <- df_w6%>% group_by(courseId) %>% 
+  dplyr::mutate(prog_week_length = as.numeric((max(week_end) - min(week_start) + 1)/7)) %>% 
+  ungroup() %>% 
+  
+  # calculated signed and done practice
+  group_by(studentId, prog_week_length, courseId) %>% 
+  dplyr::summarise(sum_duration = sum(duration)/60,
+                   duration_signed = prog_week_length*6*45,
+                   n_session = n(),
+                   n_session_signed = 6*prog_week_length
+                   ) %>% 
+  distinct() %>%
+  # % per participant
+  dplyr::summarise(
+    duration_percent = sum_duration/duration_signed*100,
+    n_session_percent = n_session/n_session_signed*100
+  ) 
+
+# percentage
+cr_df_w6 %>% describe()
+
+
+# duration over 100 is 13 out of 288
+13/288*100 # 4.5 %
+(cr_df_w6 %>% filter(duration_percent>= 100) %>% nrow())/n_distinct(cr_df_w6$studentId)*100 # more robust way:)
+
+# n_session over 100 % is 32 out of 288 -> 
+32/288*100 # 11.1 %
+(cr_df_w6 %>% filter(n_session_percent>= 100) %>% nrow())/n_distinct(cr_df_w6$studentId)*100
+
+n_distinct(cr_df_w6$studentId)
+
+
+df_w6 %>%
+  group_by(studentId, program_week, calendar_week) %>%
+  dplyr::summarise(n_session = n())
+  
+  
+```
+
+##### Adherence
+
+```{r}
+## how many percents of participants practiced at each week (defined as having a session)
+
+# creating a variable of program length
+df_w8_long <- df_w8 %>% 
+  group_by(courseId) %>% 
+  dplyr::mutate(
+    program_length = case_when(
+      76 == max(week_end) - min(week_start) | 77 == max(week_end) - min(week_start)~ "77",
+      69 == max(week_end) - min(week_start) | 70 == max(week_end) - min(week_start)  ~ "70",
+      62 == max(week_end) - min(week_start) | 63 == max(week_end) - min(week_start) ~ "63",
+      55 == max(week_end) - min(week_start) | 56 == max(week_end) - min(week_start)~ "56"
+    ) ) %>% 
+  ungroup() %>% group_by(studentId, program_length) %>% 
+  dplyr::mutate(
+    n_day_practice = (max(as.Date(startTime)) - min(week_start)),
+    program_length = as.integer(program_length))
+
+
+## calculating adherence
+df_w8_adherence <- df_w8_long %>% group_by(studentId) %>% 
+  dplyr::mutate(
+    sum_duration = sum(duration),
+    n_session = n(),
+  
+  freq_prescribed = case_when( 
+  77 == program_length ~ 6*11,
+  70 == program_length ~ 6*10,
+  63 == program_length ~ 6*9,
+  56 == program_length ~ 6*8),
+  
+  dur_prescribed = case_when(
+  77 == program_length ~ 6*11*45*60,
+  70 == program_length ~ 6*10*45*60,
+  63 == program_length ~ 6*9*45*60,
+  56 == program_length ~ 6*8*45*60 )) %>% 
+  
+  group_by(studentId, courseId, dur_prescribed, freq_prescribed, sum_duration, n_session) %>% 
+  dplyr::reframe(freq_done = case_when(
+    n_session >= freq_prescribed ~ 1,
+    n_session <= freq_prescribed ~ 0),
+    
+    dur_done = case_when(
+      sum_duration >= dur_prescribed ~ 1,
+      sum_duration <= dur_prescribed ~ 0)) 
+  
+df_w8_adherence <- 
+  df_w8_adherence %>% 
+  group_by(studentId, courseId, dur_prescribed, freq_prescribed, sum_duration, n_session, freq_done, dur_done) %>% 
+  dplyr::reframe(n_dur_done=n())
+
+summary(as.factor(df_w8_adherence$dur_done))
+
+summary(as.factor(df_w8_adherence$freq_done))
+
+```
+
+#### Timeline-drop-out graph
+
+```{r}
+## timeline of drop out
+# make a variable which dictates the end of a program
+
+df_w81 <- df_w8 %>% 
+  group_by(courseId) %>% 
+  dplyr::mutate(
+    program_length = case_when(
+      76 == max(week_end) - min(week_start) | 77 == max(week_end) - min(week_start)~ "77",
+      69 == max(week_end) - min(week_start) | 70 == max(week_end) - min(week_start)  ~ "70",
+      62 == max(week_end) - min(week_start) | 63 == max(week_end) - min(week_start) ~ "63",
+      55 == max(week_end) - min(week_start) | 56 == max(week_end) - min(week_start)~ "56"
+    ) ) %>% 
+  ungroup() %>% 
+  group_by(studentId, program_length) %>% 
+  dplyr::summarise(
+    n_day_practice = (max(as.Date(startTime)) - min(week_start))) # a day of the last practice
+df_w81  
+
+
+container <- data.frame()
+max(as.Date(df_w81$startTime))
+
+# a loop to make observation for every day till participant`s last session 
+for (i in levels(as.factor(df_w81$studentId))) {
+  S2 <- df_w81[df_w81$studentId == i,]
+
+  
+  day_program <- seq(1:S2$program_length)
+  
+  day_practice <- ifelse(S2$n_day_practice >= day_program, 1, 0)
+  
+  S1 <- as.data.frame(cbind(day_program, day_practice, rep(paste(S2$studentId), length(day_program)), rep(paste(S2$program_length), length(day_program))))
+  
+  
+  names(S1)[3] <- "studentId"
+  names(S1)[4] <- "program_length"
+  container <- rbind(container, S1)
+}
+
+# plot
+figure4 <- 
+  container %>% 
+  filter(day_practice == 1) %>% 
+  group_by(program_length, day_program) %>% 
+             dplyr::summarise(NpPpD = n(),
+                              day_program = as.numeric(day_program)/7) %>%  # divided by 7 to convert days to weeks
+  group_by(day_program) %>% 
+  dplyr::mutate(
+    overall1 = sum(NpPpD)) %>% # 1st day/7 = O.143 -> not zero, it offset the scale and it looked bad, this is a manual fix:)
+  
+  arrange(program_length, as.numeric(day_program)) %>% 
+  
+  
+  ggplot(aes(as.numeric(day_program), NpPpD, colour = program_length)) + 
+  
+  #geom_vline(xintercept = c(seq(0,11, by = 1)), colour = "grey") +
+  #geom_hline(yintercept = c(seq(0,125, by = 25)), colour = "grey") +
+  
+  geom_step() + 
+  scale_colour_discrete(
+    name = "Calendar Length", labels = c("8 Weeks", "9 Weeks", "10 Weeks", "11 Weeks")) + 
+  
+  theme_classic() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.caption = element_markdown(hjust = 0),
+        panel.grid.major.x = element_blank() ,) +
+  
+  scale_fill_viridis() +
+  scale_x_continuous(breaks = c(seq(0, 11, by = 1))) +
+  scale_y_continuous(breaks = c(seq(0, 125, by = 25))) +
+  labs(
+    title = "",
+                  x = "Week of the Program",
+                  y = "Number of Active Participants") 
+
+round(155.67983, 3)
+
+ggsave("Figure 4.pdf", figure4, path = "plots/", dpi = 600, height = 6, width = 9)
+
+```
+
+## Aim 2: Time of Practice
+
+#### Graph
+
+```{r}
+# average hour of practice
+figure5 <- 
+  df_w6 %>% 
+  dplyr::mutate(practice_hour = hour(startTime)) %>% 
+  
+  ggplot(aes(practice_hour)) + 
+  geom_bar(width = 1, color = "black", aes(fill = day_period)) + 
+  facet_grid(~ day_type) + 
+  #guides(fill = F) + 
+  #scale_fill_brewer(palette = "Paired") +
+  scale_fill_viridis(discrete = T) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(breaks = c(00, 5,12, 17, 24)) + 
+
+  # text, axis
+  labs(title = "Number of Sessions by Starting Time",
+                  x = "Practice Start Time",
+                  y = "Number of Sessions",
+       fill = "Day Period")
+
+ggsave("Figure 5.pdf", figure5, path = "plots/", dpi = 600, height = 6, width = 9)
+ggsave("Figure 5.tiff", figure5, path = "plots/", dpi = 600, height = 6, width = 9)
+```
+
+#### Aim 2.1 - Favourite Practice
+
+```{r}
+# average number of sessions among teachers 
+teacher_plot <- 
+  ggplot(total_cal_week_student, aes(y = n_session, x = as.factor(teacherId), fill=factor(teacherId))) +
+  geom_boxplot() +
+  scale_fill_viridis(discrete = TRUE) +     
+  scale_x_discrete(labels = c("1","2","3", "4", "5", "6", "7", "8", "9", "10")) +
+  labs(x = "Teacher ID",
+       y = "Mean sessions") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+## favourite practice in week of practice with free choice
+fav_free <- df_w8 %>% 
+  # unify gender categories
+  dplyr::mutate(Gender = case_when(
+    "Kvinde" == gender | "Female" == gender~ "Female",
+    "Mand" == gender | "Male" == gender~ "Male")) %>%
+  
+  # filter week 7,8, num of males, females
+  dplyr::filter(program_week >= 7 & !is.na(Gender)) %>% 
+  group_by(studentId, practice_type, Gender) %>% 
+  dplyr::summarise(n_practice = n()) %>% 
+
+  # plot
+  ggplot(aes(practice_type, n_practice, fill = Gender)) + 
+  
+  stat_boxplot() + #geom = "errorbar"
+  geom_boxplot(outlier.shape = 19, notchwidth = 0.1) + 
+  scale_fill_viridis(discrete = T) +
+  theme_classic() + 
+  labs(title = "Practice Type by Gender in 7th and 8th Week",
+                  x = "Practice Type",
+                  y = "Number of Sessions per Week",
+       fill = "Gender") + 
+  ylim(0, 10) +
+  #scale_y_continuous(breaks = seq(0, 6, by = 1)) +
+  theme()#legend.position = c(1.1,.82), legend.direction = "vertical")
+
+fav_free
+ggsave("Figure 6.pdf", fav_free, path = "plots/", dpi = 600, height = 6, width = 9)
+ggsave("Figure 6.tiff", fav_free, path = "plots/", dpi = 600, height = 6, width = 9)
+# geom_boxplot(notch = F, width=0.3, color="black", alpha = 0.2, varwidth = T) +
+#    stat_summary(fun = mean, geom = "point", size = 2, color = "red", fill = "red") +
+#   scale_fill_viridis() 
+
+#### all time ####
+fav_set <- df_w8 %>% 
+  # unify gender categories
+  dplyr::mutate(Gender = case_when(
+    "Kvinde" == gender | "Female" == gender~ "Female",
+    "Mand" == gender | "Male" == gender~ "Male")) %>%
+  
+  # filter week 7,8, num of males, females
+  dplyr::filter(program_week <= 6 & !is.na(Gender)) %>% 
+  group_by(studentId, practice_type, Gender) %>% 
+  dplyr::summarise(n_practice = n()) %>% 
+  
+  # plot
+  ggplot(aes(practice_type, n_practice, fill = Gender)) + 
+  geom_boxplot(show.legend = F) + 
+  #scale_fill_brewer(palette = "Paired") + 
+  scale_fill_viridis(discrete = T) +
+  theme_minimal() +
+  #theme(
+    # legend.position = c(.95, .95),
+    # legend.justification = c("right", "top"),
+    # legend.box.just = "right",
+    # legend.margin = margin(6, 6, 6, 6)) + 
+  labs(title = "Compulsory Part",
+                  x = "Practice Type",
+                  y = "Number of Sessions per Working Days",
+       fill = "Gender") 
+  #ylim(0, 40)# outlier 60 our over-achiever  
+
+fav_set
+
+gridExtra::grid.arrange(fav_free,
+                        fav_set,
+                        nrow = 1,
+                        top = "Average Number of Sessions By Practice Type")
+
+```
+
+## Aim 3: Consistency
+
+### dataset
+
+```{r}
+# summarise number of sessions
+df_h2_prep <-
+  df_w6 %>% group_by(studentId, program_length) %>% dplyr::mutate(n_session_all = n(),
+                                                                  program_length = as.factor(as.character(program_length))) %>%
+  group_by(studentId, courseId, teacherId, covid_period, program_length) %>%
+  dplyr::reframe(n_session = n())
+
+
+# extract mean and sd of start time!
+# morning 5-11:59 - 8 hours
+
+stab_in_mor <- df_w6 %>% group_by(studentId) %>% 
+  filter(as_hms(startTime) >= 18000 & as_hms(startTime) <= 43199) %>% 
+  dplyr::summarise(#mean_st_morning = (as.numeric(mean(as_hms(startTime)))/3600)-5,
+                  sd_st_morning = sd(as_hms(startTime)/3600))
+
+# evening 17-23:59 - 8 hours
+stab_in_eve <- df_w6 %>% group_by(studentId) %>% 
+  filter(as_hms(startTime) >= 61200 & as_hms(startTime) <= 82799) %>% 
+  dplyr::summarise(#mean_st_evening = (as.numeric(mean(as_hms(startTime)))/3600)-17,
+                  sd_st_evening = sd(as_hms(startTime)/3600))
+
+
+stab_in <- merge(stab_in_mor, stab_in_eve) 
+
+# merge and delete NA (otherwise DHARMa doesn`t work)
+df_h2 <-
+  merge(df_h2_prep, stab_in) %>% 
+  drop_na(.)
+
+df_h2$program_length <- relevel(df_h2$program_length, ref = "8")
+
+df_w6 %>% subset(studentId %in% df_h2$student)
+
+
+# w8 for some reason lowest -> reference level so making prior is easier
+df_h2 %>% 
+  group_by(program_length) %>% 
+  dplyr::summarise(n_session = mean(n_session)) 
+
+```
+
+### model
+
+```{r}
+#### Formula and prior ####
+# formula
+h2_f <- bf(n_session ~ sd_st_morning + sd_st_evening + program_length)
+
+get_prior(h2_f, df_h2, family = negbinomial())
+
+# priors
+h2_prior <- c(
+  prior(normal(3.1, 0.2), class = Intercept),
+  prior(normal(0, 0.5), class = b, coef = "sd_st_morning"),
+  prior(normal(0, 0.5), class = b, coef = "sd_st_evening"),
+  
+  
+  prior(normal(0.4, 0.3), class = b, coef = "program_length6"),
+  prior(normal(0.4, 0.3), class = b, coef = "program_length7"),
+  prior(normal(0.4, 0.3), class = b, coef = "program_length9"),
+        
+  prior(gamma(5, 0.2), class = shape)) 
+
+## visualize shape distribution for the prior
+ggplot(data = tibble(x = seq(from = 5, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 5, rate = 0.2))) +
+  geom_area(color = "transparent", 
+            fill = canva_pal("Green fields")(4)[2]) +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 150)) 
+
+
+#### prior model ####
+h2_mp <- brm(
+  formula = h2_f,
+  data = df_h2,
+  family = negbinomial("log"),
+  prior = h2_prior,
+  sample_prior = "only",
+  chains = 4,
+  cores = 4,
+  #file = "model_files/H2_prior2",
+  control = list(max_treedepth = 10, adapt_delta = 0.80),
+  backend = "cmdstanr")
+
+# prior check
+summary(h2_mp)
+
+pp_check(h2_mp, nsamples = 100)+ labs(title = "n_session ~ sd_st_morning + sd_st_evening + program_length
+                                    Prior Predictive Check")
+pp_check(h2_mp, nsamples = 100, type = "stat")
+
+#### posterior model ####
+h2_m <- brm(
+  formula = h2_f,
+  data = df_h2,
+  family = negbinomial("log"),
+  prior = h2_prior,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 8000,
+  control = list(max_treedepth = 10, adapt_delta = 0.80),
+  backend = "cmdstanr")
+
+summary(h2_m)
+
+## pp checks 
+
+pp_check(h2_m, ndraws = 100, type = "stat")
+pp_check(h2_m, ndraws = 100) + labs(title = "n_session ~ sd_st_morning + sd_st_evening + program_length
+                                    Posterior Predictive Check")
+pp_check(h2_m, ndraws = 100, type = "rootogram") + 
+  labs(title = "Posterior Predictive Check: Number of Sessions Predicted from Stability Index")
+
+
+## chains check 
+mcmc_trace(h2_m) + 
+  labs(title = "n_session ~ sd_st_morning + sd_st_evening + program_length
+       MCMC Trace Plot")
+
+summary(h2_m)
+
+#### plots ####
+### morning hypothesis plot
+hypothesis(h2_m, "sd_st_morning > 0")
+h2_hmo <- hypothesis(h2_m, "sd_st_morning > 0")
+
+plot(h2_hmo)[[1]] + labs(title = "Hypothesis Testing: the Effect of Morning Consistency on the Number of Sessions",
+                  x = "Effect Size") + theme_minimal()
+
+
+#### evening hypothesis plot
+cc <- hypothesis(h2_m, "sd_st_evening > 0")
+h2_heve <- hypothesis(h2_m, "sd_st_evening > 0")
+
+plot(h2_heve)[[1]] + labs(title = "Hypothesis Testing: the Effect of Evening Consistency on the Number of Sessions",
+                  x = "Effect Size") + theme_minimal()
+
+#### conditional effects ####
+conditional_effects(h2_m, spaghetti = T, ndraws = 100, mean = TRUE)
+
+h2_ce <- conditional_effects(h2_m)
+
+## morning
+h2_ce_mor <- plot(h2_ce)[[1]] + labs(title = "",
+                  x = "Standard deviation of morning (hours)",
+                  y = "Number of Sessions") + theme_classic()
+
+# evening
+h2_ce_eve <- plot(h2_ce)[[2]] + labs(title = "",
+                  x = "Standard deviation of evening (hours)",
+                  y = "Number of Sessions") + theme_classic()
+
+p_grid_sd <- ggarrange(plotlist = list(
+  h2_ce_mor, 
+  h2_ce_eve),
+  ncol = 
+    2,
+  nrow = 1,
+  labels = c("A", "B")
+)
+p_grid_sd
+
+ggsave("Figure 7.pdf", p_grid_sd, path = "plots/", dpi = 600, height = 6, width = 9)
+ggsave("Figure 7.tiff", p_grid_sd, path = "plots/", dpi = 600, height = 6, width = 9)
+
+#### Marginal effects ####
+comparisons(h2_m,
+            variables = c("sd_st_morning", "sd_st_evening"))
+
+avg_comparisons(h2_m,
+                conf_level = 0.95,
+            variables = c("sd_st_morning", "sd_st_evening"),
+            newdata = datagrid(program_length =c("6","7")))
+
+```
+
+## Aim 7: Covid
+
+#### dataset
+
+```{r}
+### model 1 - covid vs no covid ####
+# checking program starts and ends
+df_w6 %>% 
+  group_by(courseId,covid_period) %>% 
+  dplyr::summarise(
+    prog_start = min(week_start),
+    prog_end = max(week_end)
+  ) %>% 
+  arrange(prog_start) %>% view()
+
+# lockdown start 13th March 2020
+
+# with criteria above deviding to three groups based on lockdown, a group with both in and out of lockdown dropped
+df_covid_prep <- df_w6 %>%
+  group_by(courseId) %>% 
+  dplyr::mutate(
+    prog_start = min(week_start),
+    prog_end = max(week_end)) %>%
+  
+  dplyr::mutate(
+    covid_period = as.factor(case_when(
+      prog_end <= as.Date("2020-03-16") ~ "before_covid_lockdown",
+      prog_end >= as.Date("2020-03-17") &  prog_end <= as.Date("2020-03-24") ~ "hybrid",
+      prog_start >= as.Date("2020-03-11") ~ "covid_lockdown")))
+
+  
+
+## making df for model 1 - lockdown vs before lockdown
+df_covid2 <- df_covid_prep %>% 
+  filter(covid_period != "hybrid" & program_length!= 8) %>% # length 8 weeks not in both conditions -> exclusion
+  droplevels(.$covid_period) %>% # drop unused levels, otherwise interferes with marginal effects 
+
+  group_by(studentId, courseId, teacherId, covid_period, program_length) %>% 
+  dplyr::summarise(n_session  = n()) %>%
+  as.data.frame() %>% 
+    
+  dplyr::mutate(n_session = as.numeric(n_session),
+                program_length = as.factor(program_length),
+                studentId = as.factor(studentId),
+                covid_period = as.factor(as.character(covid_period)))
+
+
+#### model 2 - hybrid EASY ####
+# df_covid3 <- df_covid_prep %>% 
+#   # create which_week variable
+#   group_by(studentId) %>% 
+#   dplyr::mutate(
+#     which_week = ifelse(calendar_week ==max(calendar_week), "last_week", "not_last_week")) %>% 
+#   
+#   # sum by calendar week n_session
+#   group_by(studentId, courseId, teacherId, covid_period, program_length, calendar_week, which_week) %>% 
+#   dplyr::summarise(n_session  = n()) %>%
+#   as.data.frame() %>%
+#   ungroup() %>% 
+#   
+#   # sum n_session differently based on which_week
+#   group_by(studentId, courseId, teacherId, covid_period, program_length, which_week) %>% 
+#   
+#   dplyr::summarise(
+#     n_session = case_when(
+#       which_week == "not_last_week" ~ as.numeric(sum(n_session) / (program_length - 1)),
+#       which_week == "last_week" ~ as.numeric(n_session)),
+#     
+#     program_length = as.factor(program_length),
+#     studentId = as.factor(studentId),
+#     covid_period = as.factor(as.character(covid_period))) %>% 
+#   # different calculation of the n_session for last week and all others - accounting for the program length when calculating average n_session per week based on non_last weeks:)
+#   
+#   distinct() %>% 
+#   pivot_wider(names_from = which_week, values_from = n_session) # transform to wide format
+
+# stats
+# df_covid_prep %>% 
+#   dplyr::filter(program_length != 8) %>%
+#   group_by(studentId, program_length, covid_period) %>% 
+#   dplyr::mutate(n_session = n()) %>% 
+#   
+#   group_by(program_length, covid_period) %>% 
+#   dplyr::summarise(avg = mean(n_session),)
+# 
+# 
+# df_covid3 %>% 
+#   group_by(covid_period, program_length) %>% 
+#   dplyr::summarise(
+#     n_stud = n_distinct(studentId),
+#     n_cour = n_distinct(courseId))
+
+# before covid lockdown covid has in the first model 7 courses (because 2 dropped due to length 8 weeks - no equivalent in covid), while in the second hybrid has 9 - different acounting for the length:)
+
+#### model 2 - complex ####
+
+df_covid3 <- df_covid_prep %>% 
+  group_by(studentId) %>% 
+  dplyr::mutate(
+    covid_sessionn = case_when(
+      covid_period == "hybrid" & startTime >= as.Date("2020-03-13") & startTime < as.Date("2020-03-25") 
+      ~"lockdown/last_twelve",
+      covid_period == "hybrid" & startTime < as.Date("2020-03-13") ~
+        "before_lockdown/before_ltwelve",
+      covid_period != "hybrid" & (as.Date(prog_end) - as.Date(startTime)) <= 12 ~
+        "lockdown/last_twelve",
+      covid_period != "hybrid" & (as.Date(prog_end) - as.Date(startTime)) >= 13 ~
+         "before_lockdown/before_ltwelve")) %>%
+  
+  group_by(studentId, courseId, covid_period, program_length, covid_sessionn, prog_end, prog_start) %>% 
+  
+  dplyr::summarise(
+    n_session = n(),
+    n_days = case_when(
+      covid_period == "hybrid" & covid_sessionn == "lockdown/last_twelve" ~  
+        as.numeric(as.Date(prog_end) - as.Date("2020-03-12")), # 13 is already lockdown, would have to 
+      covid_period == "hybrid" & covid_sessionn == "before_lockdown/before_ltwelve" ~ 
+        as.numeric(as.Date("2020-03-13") - as.Date(prog_start)),
+      covid_period != "hybrid" & covid_sessionn == "lockdown/last_twelve" ~ 
+        as.numeric(12),
+      covid_period != "hybrid" & covid_sessionn == "before_lockdown/before_ltwelve" ~ 
+        program_length*7-12 )) %>% 
+  
+  distinct() %>% 
+  pivot_wider(names_from = covid_sessionn, values_from = c(n_session, n_days)) %>% 
+  drop_na(.) %>% # from 288 to 211 - dropping those who did not practice in both conditions - pointless to keep
+  dplyr::rename(
+    n_session_twelve = "n_session_lockdown/last_twelve",
+    n_session_twelve_offset = "n_days_lockdown/last_twelve",
+    n_session_before = "n_session_before_lockdown/before_ltwelve",
+    n_days_before = "n_days_before_lockdown/before_ltwelve") %>% 
+  
+  # calculate
+  dplyr::mutate(
+    n_session_before = n_session_before/(n_days_before/7),
+    program_length = as.factor(program_length)
+  )
+
+```
+
+#### model1 - no_covid vs covid
+
+```{r}
+#### Formula and  Prior ####
+
+# relevel
+#df_covid2$covid_period <- relevel(df_covid2$covid_period, ref = "before_covid_lockdown")
+
+# formula
+covid_f_negb <- bf(n_session ~ 1 + covid_period + program_length) 
+
+# prior
+get_prior(covid_f_negb, df_covid2, negbinomial())
+
+
+p_mp_negb <- c(
+    prior(normal(3.3,	0.4), class = Intercept),
+    prior(normal(0, 0.5), class = b, coef = covid_periodcovid_lockdown), 
+    prior(normal(1.4, 0.5), class = b, coef = program_length7), 
+    prior(gamma(1.4, 0.01), class = shape)
+)
+
+## plot for shape parameter of gamma distribution
+ggplot(data = tibble(x = seq(from = 0, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 0.7, rate = 0.01))) +
+  geom_area(color = "transparent", 
+            fill = canva_pal("Green fields")(4)[2]) +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 80)) 
+
+#### Prior Model ####
+covid_m_negb <- brm(
+  formula = covid_f_negb,
+  data = df_covid2,
+  family = negbinomial(),
+  prior = p_mp_negb,
+  sample_prior = "only",
+  chains = 4,
+  cores = 4,
+  #inits = 0,
+  control = list(max_treedepth = 10, adapt_delta = 0.9),
+  backend = "cmdstanr")
+ 
+prior_check_covid2 <- pp_check(covid_m_negb, ndraws = 100) + labs(title = "n_session ~ 1 + covid_period + program_length")
+prior_check_covid2
+
+pp_check(covid_m_negb, ndraws = 1000, type = "stat_2d") 
+pp_check(covid_m_negb, ndraws = 100, type = "stat_grouped", stat = "mean", group = "covid_period")
+
+summary(covid_m_negb)
+
+
+#### Posterior Model ####
+covid_mp_negb <- brm(
+  formula = covid_f_negb,
+  data = df_covid2,
+  family = negbinomial(),
+  prior = p_mp_negb,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 8000,
+  #inits = 0,
+  control = list(max_treedepth = 10, adapt_delta = 0.9),
+  backend = "cmdstanr")
+
+
+# posterior check
+posterior_check_covid2 <- pp_check(covid_mp_negb, ndraws = 100) + labs(title = "n_session ~ 1 + covid_period + program_length")
+posterior_check_covid2
+
+pp_check(covid_mp_negb, type = "stat_2d") #
+
+pp_check(covid_mp_negb, ndraws = 100, type = "stat_grouped", stat = "mean", group = "covid_period")
+pp_check(covid_mp_negb, ndraws = 100, type = "stat_grouped", stat = "mean", group = "program_length")
+
+# summary
+summary(covid_mp_negb)
+
+#### Plots ####
+# hypothesis
+hypothesis(covid_mp_negb, "covid_periodcovid_lockdown > 0")
+hypothesis_covid2 <- as_grob(plot(hypothesis(covid_mp_negb, "covid_periodcovid_lockdown > 0")) )
+hypothesis_covid2
+
+# conditional effects
+h7_ce <- conditional_effects(covid_mp_negb)
+
+cov2_plot <- plot(h7_ce)[[1]] + labs(title = "",
+                   x = "",
+                   y = "Average Number of Sessions") + 
+  scale_x_discrete(labels = c("Outside Covid Lockdown","Covid Lockdown")) + 
+  theme_classic() + 
+  theme(panel.grid.major = element_blank()) 
+cov2_plot
+
+# chain mixing
+mcmc_covid2 <- mcmc_trace(covid_mp_negb) + ggtitle("n_session ~ 1 + covid_period + program_length")
+mcmc_covid2
+
+plot_list_covid2 <- c(
+  prior_check_covid2, # prior ppcheck
+  posterior_check_covid2, # posterior ppcheck
+  mcmc_covid2, # mcmc
+  hypothesis_covid2)
+
+# diagnostic plot mosaic
+p_grid_covid2 <- ggarrange(plotlist = list(
+  prior_check_covid2, # prior ppcheck
+  posterior_check_covid2, # posterior ppcheck
+  mcmc_covid2, # mcmc
+  hypothesis_covid2), # hypothesis testing
+  ncol = 2,
+  nrow = 2,
+  labels = c("A", "B", "C", "D"),
+  font.label = list(size = 12)
+)
+p_grid_covid2
+
+#### Marginal effects ####
+comparisons(covid_mp_negb,
+            variables = list(
+              covid_period = c("before_covid_lockdown", "covid_lockdown")))
+
+avg_comparisons(covid_mp_negb,
+                conf_level = 0.95,
+            variables = list(covid_period = c("before_covid_lockdown", "covid_lockdown")),
+            newdata = datagrid(program_length =c("6","7")))
+```
+
+
+### model hybrid - three conditions
+```{r}
+#### Formula and  Prior e####
+# formula
+covid_f_negb3 <- bf(n_session_twelve ~ 1 + covid_period + n_session_before + offset(log(n_session_twelve_offset)))
+
+# prior
+get_prior(covid_f_negb3, df_covid3, negbinomial())
+describe(df_covid3$n_session_twelve)
+
+p_mp_negb3 <- c(
+    prior(normal(1.75,	0.3), class = Intercept),
+    prior(normal(0, 0.35), class = b, coef = covid_periodcovid_lockdown), 
+    prior(normal(0, 0.35), class = b, coef = covid_periodhybrid), 
+    #prior(normal(1.4, 0.5), class = b, coef = program_length6), 
+    #prior(normal(1.4, 0.5), class = b, coef = program_length8), 
+    #prior(normal(1.4, 0.5), class = b, coef = program_length9), 
+    prior(normal(0, 0.5), class = b, coef = n_session_before),
+    prior(gamma(0.9, 1), class = shape)
+)
+
+## plot for shape parameter of gamma distribution
+ggplot(data = tibble(x = seq(from = 0, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 0.7, rate = 0.01))) +
+  geom_area(color = "transparent", 
+            fill = canva_pal("Green fields")(4)[2]) +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 80)) 
+
+ggplot(df_covid3, aes(x = n_session_twelve)) + geom_histogram(binwidth = .5)
+
+#### Prior Model ####
+covid_m_negb3 <- brm(
+  formula = covid_f_negb3,
+  data = df_covid3,
+  family = negbinomial(),
+  prior = p_mp_negb3,
+  sample_prior = "only",
+  chains = 4,
+  cores = 4,
+  #inits = 0,
+  control = list(max_treedepth = 12, adapt_delta = 0.99),
+  backend = "cmdstanr")
+ 
+pp_check(covid_m_negb3, ndraws = 100) + labs(title = "n_session ~ 1 + covid_period + program_length
+                                    Prior Predictive Check")
+pp_check(covid_m_negb3, ndraws = 1000, type = "stat_2d") 
+pp_check(covid_m_negb3, ndraws = 100, type = "stat_grouped", stat = "mean", group = "covid_period")
+
+summary(covid_m_negb3)
+
+
+#### Posterior Model ####
+covid_mp_negb3 <- brm(
+  formula = covid_f_negb3,
+  data = df_covid3,
+  family = negbinomial(),
+  prior = p_mp_negb3,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 8000,
+  #inits = 0,
+  control = list(max_treedepth = 10, adapt_delta = 0.9),
+  backend = "cmdstanr")
+
+
+# posterior check
+pp_check(covid_mp_negb3, ndraws = 100) + labs(title = "n_session ~ 1 + covid_period + program_length
+                                    Posterior Predictive Check")
+pp_check(covid_mp_negb3, type = "stat_2d") #
+
+pp_check(covid_mp_negb3, ndraws = 100, type = "stat_grouped", stat = "mean", group = "covid_period")
+
+
+# summary
+summary(covid_mp_negb3)
+
+#### Plots ####
+# hypothesis
+hypothesis(covid_mp_negb3, "covid_periodhybrid + Intercept < Intercept") # same as < 0
+plot(hypothesis(covid_mp_negb3, "covid_periodhybrid < 0"))
+
+hypothesis(covid_mp_negb3, "covid_periodhybrid < covid_periodcovid_lockdown")
+plot(hypothesis(covid_mp_negb3, "covid_periodhybrid < covid_periodcovid_lockdown"))
+
+
+# conditional effects
+h7_ce3 <- conditional_effects(covid_mp_negb3)
+
+cov3 <- plot(h7_ce3)[[1]] + labs(title = "",
+                   x = "",
+                   y = "Average Number of Sessions") + 
+  scale_x_discrete(labels = c("Outside Covid Lockdown", "Hybrid","Covid Lockdown")) + 
+  theme_classic() + 
+  theme(panel.grid.major = element_blank()) 
+
+
+cov3
+
+covid_plot <- ggarrange(cov2_plot, cov3, nrow = 1, ncol = 2, labels = c("A", "B"))
+
+ggsave("Figure 16.pdf", covid_plot, path = "plots/", dpi = 600, height = 6, width = 9)
+ggsave("Figure 16.tiff", covid_plot, path = "plots/", dpi = 600, height = 6, width = 9)
+
+# chain mixing
+mcmc_trace(covid_mp_negb3) + ggtitle("n_session ~ 1 + covid_period + program_length
+                                    MCMC Trace Plot")
+
+
+#### Marginal effects ####
+comparisons(covid_mp_negb3,
+            variables = list(
+              covid_period = c("before_covid_lockdown", "Hybrid", "covid_lockdown")))
+
+avg_comparisons(covid_mp_negb3,
+                conf_level = 0.95,
+            variables = list(covid_period = c("before_covid_lockdown", "covid_lockdown", "hybrid")),
+            newdata = datagrid(program_length =c("6","7")))
+
+avg_comparisons(covid_mp_negb3,
+                conf_level = 0.95,
+            variables = list(covid_period = "pairwise"))
+
+```
+
+
