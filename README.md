@@ -7,8 +7,5 @@ The repository contains scripts used for cleaning and modelling the data.
 
 ### Contact
 You can get in touch with us on these emails:
-<christine.parsons@cas.au.dk>
 
-<ruta.slivkaitet@gmail.com>
-
-<kuba.raszka12@gmail.com>
+<christine.parsons@cas.au.dk>, <ruta.slivkaitet@gmail.com> or <kuba.raszka12@gmail.com>
