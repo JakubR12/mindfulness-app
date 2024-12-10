@@ -1,0 +1,3576 @@
+---
+title: "Mindfulness app"
+author: "Ruta S."
+date: "2023-07-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+```{r, libraries}
+
+library(tidyverse)
+library(brms)
+library(bayesplot)
+library(rstan)
+library(dplyr)
+library(zoo)
+library(lubridate)
+library(rcompanion)
+library(stats)
+library(grid)
+library(gridExtra)
+library(cowplot)
+library(jsonlite)
+library(Rcpp)
+library(devtools)
+library(ggplot2)
+library(viridis)
+library(DHARMa)
+library(ggpubr)
+library(ggplot2)
+
+```
+
+
+### TRANSFORMATIONS before modeling
+
+First we load the data, prepare it for modelling by merging necessary datasets, doing some data wrangling.
+
+
+#### Loading datasets
+
+```{r, loading data}
+
+
+# Loading final cleaned data
+##Data_6_weeks <- read.csv("datasets/df_6_program_weeks.csv", sep = ",", header = TRUE)
+
+temp_data <- read.csv("datasets/df_8_program_weeks.csv", nrows = 100)  # Read first 100 rows to determine classes
+default_classes <- sapply(temp_data, class)  # Get default classes
+default_classes["studentId"] <- "character"  # Replace "studentId" with the exact name of your column
+Data_8_weeks <- read.csv("datasets/df_8_program_weeks.csv", colClasses = default_classes)
+
+#Data_8_weeks <- read.csv("datasets/df_8_program_weeks.csv")
+Data_8_weeks %>% filter(studentId == "067858")
+
+# student number 067858 has a wrong calendar/program week -> manual fix of program week from 6 to 7
+Data_8_weeks$program_week[Data_8_weeks$studentId == "067858" & Data_8_weeks$calendar_week ==7 & Data_8_weeks$program_week == 6] <- 7
+
+Data_6_weeks <- Data_8_weeks %>% filter(program_week <= 6)
+
+
+
+# getting unique student ids (later used to identify the students for the merge with demo data)
+unique_ids <- as.data.frame(unique(Data_6_weeks$studentId))
+# remove last two rows which are some eroneous values
+##unique_ids <- as.data.frame(unique_ids[1:(290-2), ])  #288 ids
+names(unique_ids)[1] <- "studentId"
+
+
+# Loading demographics, questionnaires data
+data_path_demo <- "raw_data/Demographics_students/"
+files_demo <- dir(data_path_demo, pattern = "*.csv")
+
+data_demo <- files_demo %>% 
+  map(~ read_delim(file.path(data_path_demo, .), delim = "\t")) %>% 
+  reduce(rbind)
+
+data_demo
+
+# number of unique ids 
+length(unique(data_demo$studentId)) # 415 ids
+
+
+```
+
+
+#### Merging datasets: pre-processing 
+
+Merging a demographic and questionnaire dataset with a cleaned data dataset (home-practiced sessions,  6 program weeks)
+
+Before and in order to merge the two datasets the following pre-processing steps were taken:
+
+  - figuring out when each of the courses ended in order to later calculate the distance between the date of filling in questionnaires and the course end date for each student
+  - summarizing the total number of home-practiced sessions (n_session) and total home-practiced session duration in seconds (total_duration) per student after 6 program weeks
+  - Merge 1: merging program end date column with a demographic and questionnaire dataset 
+  - Merge 2: merging the demographic and questionnaire data with unique id column from a 6 program weeks dataset
+  - Merge 3: merging the demographic and questionnaire data with n_session and total_duration columns
+  
+
+```{r, pre-processing & merge}
+
+
+# getting the actual program end date per course ID. For this full dataset with max 8 program weeks was used, because that was the length of the MBSR program
+program_ending <- Data_8_weeks %>%
+  filter(program_week >= 6) %>% 
+  group_by(courseId) %>% 
+  summarize(program_end = max(week_end))
+
+# getting total session number per student (using a 6 program weeks dataset)
+n_session <- Data_6_weeks %>% 
+  group_by(studentId) %>% 
+  dplyr:: summarise(
+    n_session = n(),
+    total_duration =sum(duration))
+# remove last two rows which are some eroneous values
+##n_session <- as.data.frame(n_session[1:(290-2), ])  #288 ids
+
+
+# length of unique course ids
+length(unique(Data_6_weeks$courseId)) # 18 courseId
+length(unique(program_ending$courseId))  # 18 courseId
+
+### Merge 1
+# the merge of the official program end date column and the participants who filled in both entry and exit questionnaires 
+complete_ques <- data_demo %>%
+  filter(!is.na(q1)) %>%    # filtering out NAs in questionnaire answers columns
+  filter(!is.na(date)) %>%  # filtering out NAs in date of filling in the questionnaire column (we will need to report the time that passed after the program end and the date of filling in)
+  group_by(studentId) %>%
+  mutate(n_questionnaires = n()) %>%    # getting the number of questionnaires filled per participant
+  filter(n_questionnaires == 2) %>%     # filtering only the ones who filled in entry and exit questionnaires
+  merge(program_ending, by = "courseId", all.x = TRUE)   # merging it to the program end date column 
+
+
+### Summary of the data
+# number of unique ids after deleting NAs
+length(unique(data_demo$studentId)) # 415 ppl
+
+# number of unique ids after filtering those who filled in both entry and exit ques
+length(unique(complete_ques$studentId)) # 103 studentId
+
+# number of unique courseId after filtering those who filled in both entry and exit ques
+length(unique(complete_ques$courseId)) # 16 courseId
+
+###
+
+### Merge 2
+# merging the demographics data with unique student ids from a 6 program weeks dataset
+Data_ques <- merge(complete_ques, unique_ids, by = "studentId", all.y = T)
+
+# filtering out NAs 
+Data_ques <- Data_ques %>% 
+  filter(!is.na(q1))
+
+### Merge 3
+# merging the demographics data with n_session and duration data
+Data_ques_final <- merge(Data_ques, n_session, by = "studentId", all.y = F)
+
+# summary of the data
+length(unique(Data_ques_final$studentId)) # 81 studentId
+length(unique(Data_ques_final$courseId)) # 13 courseId
+
+```
+
+
+#### Data wrangling after the merge
+
+  - calculating participants age and translating gender variable into English
+  - renaming columns and modifying their format
+  
+```{r, data wrangling}
+
+
+### Variables modifications: Age & Gender
+# age
+Data_ques_final$Age <- 2020 - Data_ques_final$yearOfBirth
+
+# gender
+Data_ques_final$gender[Data_ques_final$gender=="Mand"] <- "Male"
+Data_ques_final$gender[Data_ques_final$gender=="Kvinde"] <- "Female"
+
+
+# selecting only the columns of interest for the wide format
+Data_ques_final_filtered <- Data_ques_final %>% dplyr::select(c(1:6, 40:50))
+
+# renaming columns 
+names(Data_ques_final_filtered)[7]<- "DASS_21_total"
+names(Data_ques_final_filtered)[8]<- "DASS_21_Stress"
+names(Data_ques_final_filtered)[9]<- "DASS_21_Anxiety"
+names(Data_ques_final_filtered)[10]<- "DASS_21_Depression"
+names(Data_ques_final_filtered)[11]<- "SF_12_Physical"
+names(Data_ques_final_filtered)[12]<- "SF_12_Mental"
+
+# converting ´date´ column into as.Date to drop the hours, minutes and seconds
+Data_ques_final_filtered$date <-as.Date(Data_ques_final_filtered$date)
+
+# renaming the column (date when the questionnaire was filled in)
+names(Data_ques_final_filtered)[6]<- "quest_fill_in"
+
+# converting to character
+Data_ques_final_filtered$quest_fill_in <- as.character(Data_ques_final_filtered$quest_fill_in)
+
+# renaming the questionnaire types, from entry to baseline, from  exit to follow-up
+Final_Dataset_DASS_SF <- Data_ques_final_filtered %>% mutate(type = case_when(type == "entry" ~ "baseline", type == "exit" ~ "follow_up"))
+
+
+# saving the dataset 
+##write_csv(Final_Dataset_DASS_SF, "datasets/DASS_SF.csv")
+
+
+```
+
+
+#### Wide format
+
+Here we transform the merged and cleaned dataset into a wide format required for regression modeling for Aim 5 & Aim 6. It creates one row per Student ID so the scores for baseline and follow-up questionnaires are in the same row.
+
+```{r, wide format}
+
+### Creating wide data format
+
+# deselecting ´date´ column, because of some reasons it did not merge same ids into one row
+##H_test_2 <- Data_ques_final_filtered[, !names(Data_ques_final_filtered) %in% c("date")]
+
+# Into a long format 
+wide_data<- pivot_wider(Final_Dataset_DASS_SF, names_from = type, names_glue = "{type}_{.value}", values_from = c(`DASS_21_total`, `DASS_21_Stress`, `DASS_21_Anxiety`, `DASS_21_Depression`, `SF_12_Physical`, `SF_12_Mental`, quest_fill_in))
+
+# saving the final dataset for testing the MBSR program effect on well- being (measured as questionnaire scores for DASS-21 and SF-12)
+## write_csv(wide_data, "datasets/wide_data.csv")
+
+
+```
+
+
+### SAMPLE DESCRIPTION
+
+##### Sample 1
+Describing total sample we used for the data analysis (we used ´Data_ques_final´ dataset) 
+
+```{r, total sample}
+
+# merging demographics data with student IDs included in the data analysis
+sample_total <- merge(data_demo, unique_ids, by = "studentId", all.y = T)
+# getting a total number of students
+sample_total %>% count(studentId) # 288 students
+
+### Variables modifications: Age & Gender
+# age
+sample_total$Age <- 2020 - sample_total$yearOfBirth
+
+# gender
+sample_total$gender[sample_total$gender=="Mand"] <- "Male"
+sample_total$gender[sample_total$gender=="Kvinde"] <- "Female"
+sample_total %>% group_by(gender) %>% count() #F=212, M=73, 1 did not report the gender, 2 NAs
+
+
+# filtering out erroneous age values
+sample_total <- sample_total %>% filter(Age > 13)
+# getting a total number of students after filtering
+sample_total %>% count(studentId) # 264 students
+
+# a dataset with only unique student IDs
+sample_total <- sample_total %>% filter(type == "entry")
+
+
+
+# Check normality of "age" data
+hist(sample_total$Age, main="Histogram of Data", xlab="Data", breaks=30, col="blue")
+qqnorm(sample_total$Age)
+qqline(sample_total$Age, col="red")
+shapiro.test(sample_total$Age)
+
+### Sample description (without erroneous age values)
+#gender 
+sample_total %>% group_by(gender) %>% count()
+#age 
+mean(sample_total$Age) # 45.76
+median(sample_total$Age) # 46
+IQR(sample_total$Age) # 20.25
+quantile(sample_total$Age, 0.25) # first quartile 35.75 
+quantile(sample_total$Age, 0.75) # third quartile 56
+sd(sample_total$Age) # 12.95
+
+min(sample_total$Age) #17
+max(sample_total$Age) #73
+```
+
+
+##### Sample 2
+Describing the sample that was used to model Aims 5: Baseline DASS-21 and SF-12 scores and amount of Practice, and Aim 6: Associations between practice sessions and subsequent DASS-21 and SF-12 scores (we used ´wide_data´ dataset). This sample consists of only those students who filled in both baseline and follow-up questionnaires.
+
+```{r, Aim 5 & Aim 6 sample}
+
+#gender
+wide_data %>% count(gender)
+
+# number of studet
+wide_data %>% count(studentId) #81
+
+# number of sessions #
+sum(wide_data$n_session) #2349
+
+#age
+# filtering out erroneous age values
+age <- wide_data %>% filter(Age > 13)
+
+mean(age$Age) # 44.37
+sd(age$Age) # 10.57
+median(age$Age) # 45
+min(age$Age) # 24
+max(age$Age) # 66
+
+
+```
+
+
+
+### SUMMARIES
+
+##### DASS and SF score summary
+
+###### N= 81
+DASS-21 and SF-21 scores summary of the students (N=81) included in the Aim 5 and Aim 6 data modeling. 
+
+```{r, DASS and SF summary}
+
+summary(wide_data)
+
+# SD DASS-21 total
+sd(wide_data$baseline_DASS_21_total)
+sd(wide_data$follow_up_DASS_21_total)
+
+# SD DASS-21 depression
+sd(wide_data$baseline_DASS_21_Depression)
+sd(wide_data$follow_up_DASS_21_Depression)
+
+# SD DASS-21 Anxiety
+sd(wide_data$baseline_DASS_21_Anxiety)
+sd(wide_data$follow_up_DASS_21_Anxiety)
+
+# SD DASS-21 Stress
+sd(wide_data$baseline_DASS_21_Stress)
+sd(wide_data$follow_up_DASS_21_Stress)
+
+# SD SF-12 Mental
+sd(wide_data$baseline_SF_12_Mental)
+sd(wide_data$follow_up_SF_12_Mental)
+
+# SD SF-12 Physical
+sd(wide_data$baseline_SF_12_Physical)
+sd(wide_data$follow_up_SF_12_Physical)
+
+
+```
+
+
+###### N= 234
+DASS-21 and SF-12 scores summary of all students included in principal analysis (N = 234)
+In total, 288 students were included in principal analysis, however 54 students did not fill in baseline questionnaires
+
+
+Total sample 288 (check if that what Jakub used), if 54 did not fill in baseline q. then we are left with 234 (rerun from the beginning so numbers are correct).
+Check if I want this: # filtering out erroneous age values
+Add number of sessions
+
+
+```{r}
+
+# filtering only the baseline (entry) questionnaires
+sample_total_summary <- sample_total %>% filter(!is.na(`DASS scoring`)) 
+
+sample_total %>% filter(type=="entry")
+
+# summary
+summary(sample_total_summary)
+
+# getting SDs
+sd(sample_total_summary$`DASS scoring`)
+sd(sample_total_summary$`DASS scoring (Anxiety)`)
+sd(sample_total_summary$`DASS scoring (Depression)`)
+sd(sample_total_summary$`DASS scoring (Stress)`)
+sd(sample_total_summary$`SF-12 scoring (Mental)`)
+sd(sample_total_summary$`SF-12 scoring (Physical)`)
+
+
+```
+
+##### Time passed and follow-up questionnaire
+
+Calculating the time that passed from the end of the program (8 weeks) until the follow-up questionnaires were filled in by every participant
+
+```{r, calculations and plotting}
+
+# turning the date column into a right format for the calculations (lubridade package)
+# Convert to character 
+wide_data$baseline_quest_fill_in <- as.character(wide_data$baseline_quest_fill_in)
+wide_data$follow_up_quest_fill_in <- as.character(wide_data$follow_up_quest_fill_in)
+wide_data$baseline_quest_fill_in <- ymd(wide_data$baseline_quest_fill_in)
+wide_data$`follow_up_quest_fill_in` <- ymd(wide_data$`follow_up_quest_fill_in`)
+wide_data$`program_end` <- ymd(wide_data$`program_end`)
+
+# calculating the time that passed from the end of the program until the exit questionnaire was filled in
+wide_data <- wide_data %>% mutate(air_time = `follow_up_quest_fill_in` - program_end)
+
+
+
+# max, min and median of days
+max(wide_data$air_time, na.rm = TRUE) # 265 days
+min(wide_data$air_time, na.rm = TRUE) # -72 days
+median(wide_data$air_time,na.rm = TRUE) # 12.5 days
+mean(wide_data$air_time,na.rm = TRUE) # 32.25676 days
+
+# plotting the distribution
+wide_data %>% 
+    ggplot(aes(air_time)) +
+    geom_histogram() +
+    theme_classic() +
+    labs(title = "Days between the end of MBSR program (6 programme weeks) and filling in 
+    the follow-up questionaire"
+         ,
+         x = "Days elapsed from the end of MBSR program",
+         y = "Students count")
+
+# number of students who filled in the follow-up questionnaire within 14 days
+air_time_14 <- wide_data$air_time <= 14 & wide_data$air_time >= 0
+sum(air_time_14, na.rm = TRUE) # 39 students
+    
+
+air_time_14
+```
+
+
+
+##### Teachers, Courses, Calendar Weeks and ammount of practice
+
+Reported in a table format in the written paper in the Appendix.
+
+```{r, summary: teachers and courses}
+
+# Using final cleaned data from 6 program weeks
+Data_6_weeks
+
+# Below we are calculating maximum number of calendar weeks to account for in the model - courses had varying amount of calendar weeks for different teachers/courses due to holiday weeks and students were still practising during the holiday weeks
+
+
+### SUMMARY: TEACHER ID
+
+# summarising total number of sessions and maximum number of calendar weeks on a student level
+total_cal_week_student <- Data_6_weeks %>% 
+                          group_by(studentId, courseId, teacherId) %>% 
+                          dplyr:: summarise(
+                                  n_session = n(),
+                                  calendar_weeks_total = max(w_number_accurate)
+                                  )
+
+
+# total and average number of sessions, sd and median of sessions total number of courses and students per teacher ID
+total_cal_week_student
+
+total_cal_week_student$teacherId <- as.factor(total_cal_week_student$teacherId)
+
+teacher_summary <- total_cal_week_student %>% 
+  group_by(teacherId) %>% 
+  dplyr::summarise(av_session = sum(n_session)/n(),
+                   sd_session = sd(n_session),
+                   median = median(n_session),
+                   n_session = sum(n_session),
+                   courses = length(unique(courseId)),
+                   students = length(unique(studentId))
+   
+  )
+
+min(teacher_summary$av_session)
+max(teacher_summary$av_session)
+
+total_cal_week_student %>% group_by(teacherId) %>% dplyr::summarise(n_session)
+
+
+total_cal_week_student %>%
+  filter(teacherId == 1) %>%  
+  arrange(desc(n_session)) 
+
+# mean and sd of students among teachers
+mean(teacher_summary$students) #28.8
+sd(teacher_summary$students) #17.12
+median(teacher_summary$students) #23.5
+
+total_cal_week_student %>% group_by(teacherId) %>% dplyr::summarise(median = median(n_session))
+min(median_teacher$median)
+max(median_teacher$median)
+
+
+# getting the range of sessions for each teacher (reported by subtracting min value from maximum value)
+total_cal_week_student %>% group_by(teacherId) %>% dplyr::summarise(range(n_session))
+
+# saving the dataset
+##write_csv(teacher_summary, "datasets/teacher_summary.csv")
+
+
+### SUMMARY: COURSE ID
+
+# summarising total, average number of sessions, sd, median and number of students per course 
+course_summary <- total_cal_week_student %>% group_by(teacherId, courseId) %>% 
+  dplyr:: summarise(
+    av_session = sum(n_session)/n(),
+    sd = sd(n_session),
+    n_session = sum(n_session),
+    median = median(n_session),
+    students = length(unique(studentId))
+   )
+
+
+min(course_summary$av_session)
+max(course_summary$av_session)
+
+
+median_course <- total_cal_week_student %>% group_by(courseId) %>% dplyr:: summarise(median = median(n_session))
+min(median_course$median)
+max(median_course$median)
+
+# mean and sd of students across courses
+mean(course_summary$students) #16
+sd(course_summary$students) #6.47
+median(course_summary$students) #16
+
+# getting the range of sessions for each course
+total_cal_week_student %>% group_by(courseId) %>% dplyr::summarise(range(n_session))
+
+
+# saving the dataset
+##write_csv(course_summary, "datasets/course_summary.csv")
+
+```
+
+
+
+
+### PLOTS
+
+##### Teachers, Courses, Calendar Weeks and Amount of Practice 
+```{r, plots: teachers and courses}
+
+
+### TEACHERS
+
+# average number of sessions among teachers 
+teacher_plot <- ggplot(total_cal_week_student, aes(y = n_session, x = as.factor(teacherId), fill=factor(teacherId))) +
+  geom_boxplot() +
+  scale_fill_viridis(discrete = TRUE) +     
+  scale_x_discrete(labels = c("1","2","3", "4", "5", "6", "7", "8", "9", "10")) +
+  labs(x = "Teacher ID",
+       y = "Mean sessions") +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+ggsave("teacher_plot.png", plot = teacher_plot, width = 12, height = 8, dpi = 300)  
+
+
+### COURSES GROUPED BY TEACHERS
+
+# getting number of sessions per course (used for plotting)
+# course_df <- Teacher_course_effect %>% group_by(studentId,teacherId, courseId) %>% 
+#   dplyr:: summarise(
+#     n_session = n())
+
+# average number of sessions among teachers divided into courses
+teacher_course_plot <- ggplot(total_cal_week_student, aes(y = n_session, x = as.factor(teacherId), group= as.factor(courseId) , fill=factor(teacherId))) +
+  geom_boxplot() +
+   scale_fill_viridis(discrete = TRUE) +
+  scale_x_discrete(labels = c("1","2","3", "4", "5", "6", "7", "8", "9", "10")) +
+  labs(x = "Teacher ID",
+       y = "Mean sessions") +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+
+## COURSES
+
+class(total_cal_week_student$courseId)
+# average number of sessions among courses
+course_plot <- ggplot(total_cal_week_student, aes(y = n_session, x = as.factor(courseId))) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("1","2","3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(vjust = 0.5, hjust=1)) +
+  labs(x = "Course ID",
+       y = "Mean sessions")
+  
+
+# # Adjust plot margins (top, right, bottom, left)
+# adjusted_teacher_plot <- teacher_plot + theme(plot.margin = margin(5, 5, 5, 5, "mm"))
+# adjusted_teacher_course_plot <- teacher_course_plot + theme(plot.margin = margin(5, 5, 5, 5, "mm"))
+# adjusted_course_plot <- course_plot + theme(plot.margin = margin(5, 5, 5, 5, "mm"))
+# 
+# # Grid ploting
+# # Teacher, course plots
+# p_grid_teacher_course <- ggarrange(
+#   adjusted_teacher_plot,
+#   adjusted_teacher_course_plot,
+#   adjusted_course_plot,
+#   ncol = 2,
+#   nrow = 2,
+#   labels = c("A", "B", "C"))
+# p_grid_teacher_course
+# 
+# ggsave("p_grid_teacher_course.png", plot = p_grid_teacher_course, width = 12, height = 10, dpi = 300) 
+ 
+
+###############
+
+# Arrange plots A and B in a single column
+ab_row <- ggarrange(
+  teacher_plot,
+  teacher_course_plot,
+  ncol = 2,
+  nrow = 1,
+  labels = c("A", "B")
+)
+
+
+course_plot <- ggarrange(
+  course_plot,
+  ncol = 1,
+  nrow = 1,
+  labels = c("C")
+)
+
+
+# Use plot_grid from cowplot to arrange the AB column and plot C
+# The 'rel_widths' argument is used to control the relative width of each plot
+p_grid_teacher_course <- plot_grid(
+    ab_row, 
+    course_plot, 
+    ncol = 1, 
+    rel_heights = c(2, 3) # control the height # set to 1,1 to make the same height
+    #label_x = 0, # Adjust label X position
+    #label_y = 0.04 # Adjust label Y position
+)
+
+p_grid_teacher_course
+ggsave("p_grid_teacher_course.tiff", plot = p_grid_teacher_course, width = 12, height = 10, dpi = 300) 
+ 
+
+```
+
+```{r}
+# 
+# # adding total sessions & calendar weeks number to the full dataset
+# Teacher_course_effect <- merge(total_cal_week_student, Data_6_weeks, by = "studentId", all.y = T)
+# # Renaming the columns 
+# names(Teacher_course_effect)[2]<- "courseId"
+# names(Teacher_course_effect)[3]<- "teacherId"
+
+
+
+```
+
+
+
+### MODELLING
+
+### Distributions
+#### Gama distribution
+```{r}
+
+#### plot for shape parameter of gamma distribution ####
+ggplot(data = tibble(x = seq(from = 0, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 0.5, rate = 0.3))) +
+  geom_area(color = "transparent") +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 80)) 
+
+ggplot(data = tibble(x = seq(from = 0, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 1.7, rate = 0.05))) +
+  geom_area(color = "transparent") +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 80)) 
+
+
+
+# distributions of model predictors
+ggplot(wide_data, aes(x = baseline_DASS_21_total)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_DASS_21_Depression)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_DASS_21_Anxiety)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_DASS_21_Stress)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_DASS_21_Stress)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_SF_12_Mental)) +
+  geom_density()
+
+ggplot(wide_data, aes(x = baseline_SF_12_Physical)) +
+  geom_density()
+
+
+
+```
+
+
+#### Sigma distribution
+```{r}
+
+library(statmod)  # for dcauchy function
+
+# Chosen parameters for the half-Cauchy distribution
+location <- 15
+scale <- 5
+
+# Create a tibble with x values
+df <- data.frame(x = seq(0, 20, by = 0.01))
+
+# Calculate the probability density function (PDF) for each x
+df$y <- dcauchy(df$x, location = location, scale = scale)
+
+# Create a ggplot for the prior distribution of sigma
+ggplot(data = df, aes(x = x, y = y)) +
+  geom_line(color = "blue") +
+  labs(title = "Prior Distribution of Sigma (Half-Cauchy)")
+
+
+```
+
+
+
+
+### Aim 4: Teachers, Courses, Calendar Weeks and Amount of Practice
+
+```{r, Aim 4}
+
+set.seed(699)
+# transforming the variables
+total_cal_week_student$teacherId <- as.factor(total_cal_week_student$teacherId)
+total_cal_week_student$courseId <- as.factor(total_cal_week_student$courseId)
+total_cal_week_student$studentId <- as.factor(total_cal_week_student$studentId)
+total_cal_week_student$calendar_weeks_total <- as.factor(total_cal_week_student$calendar_weeks_total)
+total_cal_week_student$n_session <- as.integer(total_cal_week_student$n_session)
+
+# the ids of teachers who have more than one course
+total_cal_week_student %>% group_by(teacherId) %>%  summarize(num_courses = n_distinct(courseId))
+
+# creating a dataset with the teachers who have more than one course
+teacher_df <- total_cal_week_student %>% filter(teacherId == 1 | teacherId == 2 | teacherId == 4 | teacherId == 9 | teacherId == 10)
+
+
+# the distribution of the outcome variable
+ggplot(teacher_df, aes(x = n_session)) +
+  geom_density()
+
+ggplot(teacher_df, aes(x = courseId)) +
+  geom_density()
+
+ggplot(teacher_df, aes(x = teacherId)) +
+  geom_density()
+
+ggplot(teacher_df, aes(x = calendar_weeks_total)) +
+  geom_density()
+
+
+
+# Model´s formula
+Teacher_course_effect <- bf(n_session ~ (1|courseId) + (1|teacherId) + (1|calendar_weeks_total))
+
+# Priors
+get_prior(Teacher_course_effect, total_cal_week_student, family = negbinomial(link = "log"))
+
+mean(teacher_df$n_session) #24.98
+sd(teacher_df$n_session)  #14.32
+
+# log of mean
+log(24.98) #3.91
+log(14.32) # 3.35
+log(57.3) #4.04
+log(1) #0
+
+exp(0)
+exp(0.09)
+
+
+
+priorNsession_aim4 <- c(
+  prior(normal(3.21, 0.05),class= Intercept), 
+  prior(normal(0, 0.09), class=sd), 
+  prior(gamma(1.3, 0.01), class=shape))
+
+##prior(gamma(1.7, 0.05)
+#prior(gamma(1.3, 0.01)
+
+# Prior predictive check
+Teacher_course_PriorCheck_m <- brm(
+  formula = Teacher_course_effect,
+  data = teacher_df,
+  family = negbinomial(),
+  prior = priorNsession_aim4,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99))
+
+prior_teacher <- pp_check(Teacher_course_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ (1|courseId) + (1|teacherId) + (1|calendar_weeks_total), 
+Prior predictive check") + theme_classic()
+prior_teacher
+pp_check(Teacher_course_PriorCheck_m, nsamples = 100, type = "rootogram")
+summary(Teacher_course_PriorCheck_m)
+ggsave("prior_teacher.png", plot = prior_teacher, width = 10, height = 8, dpi = 300)  
+
+
+# Fitting the model
+Teacher_course_m <- brm(
+  formula = Teacher_course_effect,
+  data = teacher_df,
+  family = negbinomial(),
+  prior = priorNsession_aim4,
+  sample_prior = T,
+  chains = 3,
+  cores = 3,
+  iter = 10000,
+  control = list(max_treedepth = 15, adapt_delta = 0.99))
+
+## posterior predictive check
+post_teacher <- pp_check(Teacher_course_m, nsamples = 100) + ggtitle("n_session ~ (1|courseId) + (1|teacherId) + (1|calendar_weeks_total), 
+Posterior predictive check") + theme_classic()
+pp_check(Teacher_course_m, nsamples = 100, type = "rootogram")
+summary(Teacher_course_m)
+ggsave("post_teacher.png", plot = post_teacher, width = 10, height = 8, dpi = 300)  
+
+post_teacher
+
+
+
+# Validity check
+
+# Chain check
+
+# trace plot of intercept and sd 
+mcmc_teacher_int <- mcmc_trace(Teacher_course_m, regex_pars = "_Intercept") + ggtitle("n_session ~ (1|courseId) + (1|teacherId) + (1|calendar_weeks_total),
+MCMC trace plot, Intercept") + theme_classic()
+
+mcmc_teacher_sd <- mcmc_trace(Teacher_course_m, regex_pars = "sd") + ggtitle("n_session ~ (1|courseId) + (1|teacherId) + (1|calendar_weeks_total),
+MCMC trace plot, sd") + theme_classic()
+
+ggsave("mcmc_teacher_int.png", plot = mcmc_teacher_int, width = 10, height = 8, dpi = 300)
+ggsave("mcmc_teacher_sd.png", plot = mcmc_teacher_sd, width = 10, height = 8, dpi = 300)
+
+
+# Results
+
+# Exponentiating estimates
+exp(0.06) #1.06  #course Id, 29.53 % of variability
+exp(0.35) #1.41  #calendar weeks, 39.28 % of variability
+exp(0.12) #1.12  #teacher Id, 31.19 % of variability
+exp(3.16) # population-level effects. 23.57
+
+# CIs for course Id
+exp(0.00) #1
+exp(0.17) #1.18
+# est. error
+exp(0.04) #1.04
+
+# CIs for teacher Id
+exp(0.01) #1.01
+exp(0.25) #1.28  #############
+# est. error
+exp(0.06) #1.06
+
+#CIs for calendar weeks
+exp(0.26) #1.29
+exp(0.46) #1.58 #############
+# est. error
+exp(0.05) #1.05
+
+```
+
+
+
+### Aim 5 (N = 234): Baseline DASS-21 and SF-12 scores and amount of Practice 
+
+
+```{r}
+
+##### Preparing the dataset
+
+# merging demographics data with student IDs included in the principal data analysis
+sample_total <- merge(data_demo, unique_ids, by = "studentId", all.y = T)
+# getting a total number of students
+sample_total %>% count(studentId) # 288 students
+
+sample_total_baseline <- sample_total %>% filter(type=="entry") # left with N = 286 cause of NAs
+
+
+# filtering only the baseline (entry) questionnaires
+sample_total_aim5_baseline <- sample_total_baseline %>% filter(!is.na(`DASS scoring`)) # left with N = 234, cause of NAs. Now we still have 0s
+
+# combining questionnaire data with the n_session from Data_6_weeks dataset
+sample_total_aim5_baseline <- merge(sample_total_aim5_baseline, n_session, by = "studentId", all.y = T)
+sample_total_aim5_baseline <- sample_total_aim5_baseline %>% filter(!is.na(`DASS scoring`)) #N = 234
+
+# summary
+summary(sample_total_aim5_baseline)
+
+
+# renaming the columns
+names(sample_total_aim5_baseline)[40]<- "baseline_DASS_21_total"
+names(sample_total_aim5_baseline)[41]<- "baseline_DASS_21_Stress"
+names(sample_total_aim5_baseline)[42]<- "baseline_DASS_21_Anxiety"
+names(sample_total_aim5_baseline)[43]<- "baseline_DASS_21_Depression"
+names(sample_total_aim5_baseline)[44]<- "baseline_SF_12_Physical"
+names(sample_total_aim5_baseline)[45]<- "baseline_SF_12_Mental"
+
+
+
+```
+
+
+###### DASS-21 Total
+
+
+```{r, gamma distribution}
+
+
+ggplot(data = tibble(x = seq(from = 0, to = 70, by = .01)),
+       aes(x = x, y = dgamma(x, shape = 1, rate = 0.02))) +
+  geom_area(color = "transparent") +
+  scale_x_continuous(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  coord_cartesian(xlim = c(0, 80)) 
+
+
+ggplot(sample_total_aim5_baseline, aes(x = baseline_DASS_21_total)) +
+  geom_density()
+
+
+
+```
+
+
+```{r, Aim 5: DASS-21 total, N = 234}
+
+set.seed(132)
+mean(sample_total_aim5_baseline$baseline_DASS_21_total)
+sd(sample_total_aim5_baseline$baseline_DASS_21_total)
+
+
+# Model´s formula
+Baseline_DASS_total <- bf(n_session ~ 1 + baseline_DASS_21_total)
+
+# Priors
+priors_baseline <- get_prior(Baseline_DASS_total, family = poisson(link = "log"), data=sample_total_aim5_baseline)
+priors_baseline
+
+mean(sample_total_aim5_baseline$n_session)
+sd(sample_total_aim5_baseline$n_session)
+
+# log 
+log(25.11) #3.22
+
+
+priorNsession_aim5_baseline_total <- c(
+  prior(normal(3.22, 0.05),class= Intercept), # mean = number of sessions and variance
+  prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+  prior(gamma(1.3, 0.01), class=shape)) # variation
+
+
+# Prior predictive check
+Baseline_total_aim5_PriorCheck_m <- brm(
+  formula = Baseline_DASS_total,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_total,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+plot1 <-pp_check(Baseline_total_aim5_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Prior predictive check") + theme_classic()
+pp_check(Baseline_total_aim5_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Prior predictive check")
+summary(Baseline_total_aim5_PriorCheck_m)
+#ggsave("plot1.png", plot = plot1, width = 10, height = 8, dpi = 300)  
+plot1
+
+
+
+
+sum(wide_data$n_session)
+
+# Fitting the model
+Baseline_total_aim5_m <- brm(
+  formula = Baseline_DASS_total,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_total,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+plot2 <- pp_check(Baseline_total_aim5_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_total,
+Posterior predictive check") + theme_classic()
+pp_check(Baseline_total_aim5_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Posterior predictive check") 
+summary(Baseline_total_aim5_m)
+#ggsave("plot2.png", plot = plot2, width = 10, height = 8, dpi = 300) 
+plot2
+
+
+
+
+# Validity check
+
+# Chain check
+plot3 <- mcmc_trace(Baseline_total_aim5_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_total") + theme_classic()
+plot(Baseline_total_aim5_m)
+#ggsave("plot3.png", plot = plot3, width = 10, height = 8, dpi = 300) 
+
+
+
+# Checking for overdispersion
+model.check_total <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_total_aim5_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_total_aim5_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_total
+plot(model.check_total)
+testDispersion(model.check_total)
+
+
+# Hypothesis testing
+hypothesis(Baseline_total_aim5_m, "baseline_DASS_21_total > 0") 
+plot4 <- plot(hypothesis(Baseline_total_aim5_m, "baseline_DASS_21_total > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 total score
+on the number of practice sessions is positive") 
+#ggsave("plot4.tiff", plot = plot4, width = 10, height = 8, dpi = 300)
+
+
+
+Total_ce <- conditional_effects(Baseline_total_aim5_m)
+p1 <- plot(Total_ce)[[1]] + labs(title = "Total",
+                  x = "Baseline DASS-21 Total score",
+                  y = "Average Number of Sessions") + geom_line(color = "black")+ theme_classic()
+
+p1
+
+
+
+# Results
+
+exp(0.00) #1
+exp(-0.01) #0.99
+exp(0.01) #1.01
+ 
+         
+
+# Marginal effects
+library(ggeffects)
+M_total <- ggpredict(Baseline_total_aim5_m, "baseline_DASS_21_total", full.data = TRUE)
+print(M_total, n = Inf)
+
+M_total <- ggpredict(Baseline_total_aim5_m, terms = c("baseline_DASS_21_total [all]"))
+print(M_total, n = Inf)
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_total <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(10, 11), c(11, 12), c(12, 13), c(13, 14), c(14, 15), c(15, 16), c(16, 17), c(17, 18), c(18, 19), c(19, 20), c(20, 21), c(21, 22), c(22, 23), c(23, 24), c(24, 25), c(25, 26), c(26, 27), c(27, 28), c(28, 29), c(29, 30), c(30, 31), c(31, 32), c(32, 33), c(33, 34), c(34, 35), c(35, 36), c(36, 37), c(37, 38), c(38, 39), c(39, 40), c(40, 41), c(41, 42), c(42, 43), c(43, 44), c(44, 45),c(45, 46))
+
+
+result_df_Total <- data.frame(
+  range_start = seq(0, 45),    # Vary every digit from 0 to 23
+  range_end = seq(1, 46),       # Corresponding end values
+  difference = numeric(length = 46)  # Assuming 24 rows based on the specified range
+)
+
+# Loop through each range
+for (i in seq_along(ranges_total)) {
+  # Extract the current range
+  current_range <- ranges_total[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_total_aim5_m, 
+                    terms = c("baseline_DASS_21_total[current_range]"))
+  
+  # Calculate the difference and store it in the result dataframe
+  result_df_Total$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Total)
+
+# calculate the mean of differences
+mean(result_df_Total$difference) 
+# 0.03
+
+
+
+```
+
+###### DASS-21 Depression
+```{r, Aim 5: DASS-21 Depression, N=234}
+
+set.seed(123)
+mean(sample_total_aim5_baseline$baseline_DASS_21_Depression)
+sd(sample_total_aim5_baseline$baseline_DASS_21_Depression)
+mean(sample_total_aim5_baseline$n_session)
+sd(sample_total_aim5_baseline$n_session)
+
+# Model´s formula
+Baseline_DASS_depression <- bf(n_session ~ 1 + baseline_DASS_21_Depression)
+
+# Priors
+priors_depression <- get_prior(Baseline_DASS_depression, family = negbinomial(link = "log"), data=sample_total_aim5_baseline)
+priors_depression
+
+
+# log of mean and variance
+log(50)
+log(30)
+
+# priorNsession_aim5_baseline_total <- c(
+#   prior(normal(3.22, 0.05),class= Intercept), # mean = number of sessions and variance
+#   prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+#   prior(gamma(1.3, 0.01), class=shape)) # variation
+
+
+
+priorNsession_aim5_baseline_dep <- c(
+  prior(normal(3.22, 0.005),class= Intercept), # mean = number of sessions and variance
+  prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+  prior(gamma(1, 0.01), class=shape)) # a variance
+
+
+
+
+# Prior predictive check
+Baseline_depression_aim5_PriorCheck_m <- brm(
+  formula = Baseline_DASS_depression,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_dep,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+plot5 <- pp_check(Baseline_depression_aim5_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Prior predictive check") + theme_classic()
+
+pp_check(Baseline_depression_aim5_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Prior predictive check") 
+summary(Baseline_depression_aim5_PriorCheck_m)
+##ggsave("plot5.png", plot = plot5, width = 10, height = 8, dpi = 300)  
+plot5
+
+# Fitting the model
+Baseline_depression_aim5_m <- brm(
+  formula = Baseline_DASS_depression,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_dep,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+plot6 <- pp_check(Baseline_depression_aim5_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Posterior predictive check")+ theme_classic()
+pp_check(Baseline_depression_aim5_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Posterior predictive check") 
+summary(Baseline_depression_aim5_m)
+##ggsave("plot6.png", plot = plot6, width = 10, height = 8, dpi = 300)  
+plot6
+
+# Results
+exp(0.00) #Estimate = 1 
+exp(-0.02) # l-95% CI = 0.98
+exp(0.02) # u-95% CI = 1.02
+exp(0.01) # est. error = 1.01
+
+
+
+# Validity check
+
+# Chain check
+plot7 <- mcmc_trace(Baseline_depression_aim5_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, MCMC trace plot") + theme_classic()
+plot(Baseline_depression_aim5_m)
+#ggsave("plot7.png", plot = plot7, width = 10, height = 8, dpi = 300)
+plot7
+
+
+
+# Checking for overdispersion
+model.check_depression <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_depression_aim5_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_depression_aim5_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_depression
+plot(model.check_depression)
+testDispersion(model.check_depression)
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_depression_aim5_m, "baseline_DASS_21_Depression > 0")
+plot8 <- plot(hypothesis(Baseline_depression_aim5_m, "baseline_DASS_21_Depression > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 depression score
+on the number of practice sessions is positive") 
+#ggsave("plot8.png", plot = plot8, width = 10, height = 8, dpi = 300)
+plot8
+
+
+
+
+Depression_ce <- conditional_effects(Baseline_depression_aim5_m)
+p2 <- plot(Depression_ce)[[1]] + labs(title = "Depression",
+                  x = "Baseline DASS-21 Depression score",
+                  y = "Average Number of Sessions") +   geom_line(color = "black")+ theme_classic()
+
+p2
+
+
+
+# Marginal effects
+library(ggeffects)
+M_Depression <- ggpredict(Baseline_depression_aim5_m, "baseline_DASS_21_Depression", full.data = TRUE)
+print(M_Depression, n = Inf)
+
+# Average marginal effects ( creating a loop calculate an average)
+# Specify the ranges
+ranges_depression <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(12, 13), c(13, 14), c(14, 15), c(15, 16), c(16, 17), c(17, 18))
+
+# Create an empty dataframe to store results
+result_df_Depression <- data.frame(
+  range_start = numeric(length = length(ranges_depression)),
+  range_end = numeric(length = length(ranges_depression)),
+  difference = numeric(length = length(ranges_depression))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_depression)) {
+  # Extract the current range
+  current_range <- ranges_depression[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_depression_aim5_m, 
+                    terms = c("baseline_DASS_21_Depression[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Depression$range_start[i] <- current_range[1]
+  result_df_Depression$range_end[i] <- current_range[2]
+  result_df_Depression$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Depression)
+
+# Calculate the mean of differences
+mean(result_df_Depression$difference) #0.08
+
+
+```
+
+###### DASS-21 Anxiety
+```{r, Aim 5: DASS-21 Anxiety, N = 234}
+
+set.seed(432)
+mean(sample_total_aim5_baseline$baseline_DASS_21_Anxiety)
+sd(sample_total_aim5_baseline$baseline_DASS_21_Anxiety)
+
+log(2.88)
+log(3.14)
+
+# Model´s formula
+Baseline_DASS_anxiety <- bf(n_session ~ 1 + baseline_DASS_21_Anxiety)
+
+# Priors
+priors_anxiety <- get_prior(Baseline_DASS_anxiety, family = negbinomial(link = "log"), data=sample_total_aim5_baseline)
+priors_anxiety
+
+
+# log of mean
+log(29) #3.36
+log(1) #0
+
+# priorNsession_aim5_baseline <- c(
+#   prior(normal(3.40, 2.70),class= Intercept), 
+#   prior(normal(0, 0.09), class= b),
+#   prior(gamma(1, 0.03), class=shape))
+
+
+
+# priorNsession_aim5_baseline_anx <- c(
+#   prior(normal(3.91, 0.1),class= Intercept), #mean = number of sessions and variance
+#   prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+#   prior(gamma(1, 0.01), class=shape)) #a variance
+
+
+
+priorNsession_aim5_baseline_anx <- c(
+  prior(normal(3.22, 0.005),class= Intercept), # mean = number of sessions and variance
+  prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+  prior(gamma(1, 0.01), class=shape)) # a variance
+
+
+# Prior predictive check
+Baseline_anxiety_aim5_PriorCheck_m <- brm(
+  formula = Baseline_DASS_anxiety,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_anx,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+plot9 <- pp_check(Baseline_anxiety_aim5_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Prior predictive check") + theme_classic()
+pp_check(Baseline_anxiety_aim5_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Prior predictive check") 
+summary(Baseline_anxiety_aim5_PriorCheck_m)
+##ggsave("plot9.png", plot = plot9, width = 10, height = 8, dpi = 300)  
+plot9
+
+
+
+# Fitting the model
+Baseline_anxiety_aim5_m <- brm(
+  formula = Baseline_DASS_anxiety,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_anx,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+plot10 <- pp_check(Baseline_anxiety_aim5_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Posterior predictive check") + theme_classic()
+pp_check(Baseline_anxiety_aim5_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Posterior predictive check") 
+summary(Baseline_anxiety_aim5_m)
+##ggsave("plot10.png", plot = plot10, width = 10, height = 8, dpi = 300)  
+plot10
+
+
+# Results
+exp(-0.01) #Estimate = 0.99
+exp(-0.03) # l-95% CI = 0.97
+exp(0.01) # u-95% CI = 1.01
+exp(0.01) # est. error = 1.01
+
+
+
+
+# Validity check
+
+# Chain check
+plot11 <- mcmc_trace(Baseline_anxiety_aim5_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, MCMC trace plot") + theme_classic()
+plot(Baseline_anxiety_aim5_m)
+##ggsave("plot11.png", plot = plot11, width = 10, height = 8, dpi = 300)  
+plot11
+
+# Checking for overdispersion
+model.check_anxiety <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_anxiety_aim5_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_anxiety_aim5_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_anxiety
+plot(model.check_anxiety)
+testDispersion(model.check_anxiety)
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_anxiety_aim5_m, "baseline_DASS_21_Anxiety < 0")
+plot12 <- plot(hypothesis(Baseline_anxiety_aim5_m, "baseline_DASS_21_Anxiety < 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 anxiety score
+on the number of practice sessions is negative") + theme_classic()
+ggsave("plot12.png", plot = plot12, width = 10, height = 8, dpi = 300)
+plot12
+
+
+
+
+Anxiety_ce <- conditional_effects(Baseline_anxiety_aim5_m)
+p3 <- plot(Anxiety_ce)[[1]] + labs(title = "Anxiety",
+                  x = "Baseline DASS-21 Anxiety score",
+                  y = "Average Number of Sessions") +   geom_line(color = "black") + theme_classic()
+
+p3
+
+
+
+ 
+
+# Marginal effects
+library(ggeffects)
+M_Anxiety <- ggpredict(Baseline_anxiety_aim5_m, "baseline_DASS_21_Anxiety", full.data = TRUE)
+print(M_Anxiety, n = Inf)
+
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_anxiety <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(13, 14))
+
+# Create an empty dataframe to store results
+result_df_Anxiety <- data.frame(
+  range_start = numeric(length = length(ranges_anxiety)),
+  range_end = numeric(length = length(ranges_anxiety)),
+  difference = numeric(length = length(ranges_anxiety))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_anxiety)) {
+  # Extract the current range
+  current_range <- ranges_anxiety[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_anxiety_aim5_m, 
+                    terms = c("baseline_DASS_21_Anxiety[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Anxiety$range_start[i] <- current_range[1]
+  result_df_Anxiety$range_end[i] <- current_range[2]
+  result_df_Anxiety$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Anxiety)
+
+# Calculate the mean of differences
+mean(result_df_Anxiety$difference) # -0.26
+
+
+```
+###### DASS-21 Stress
+```{r, Aim 5: DASS-21 Anxiety, N = 234}
+
+set.seed(499)
+mean(sample_total_aim5_baseline$baseline_DASS_21_Stress)
+sd(sample_total_aim5_baseline$baseline_DASS_21_Stress)
+
+log(7.43)
+log(4.01)
+
+# Model´s formula
+Baseline_DASS_stress <- bf(n_session ~ 1 + baseline_DASS_21_Stress)
+
+# Priors
+priors_stress <- get_prior(Baseline_DASS_stress, family = negbinomial(link = "log"), data=sample_total_aim5_baseline)
+priors_stress
+
+
+# log of mean
+log(29) #3.36
+log(1) #0
+
+
+
+# priorNsession_aim5_baseline_stress <- c(
+#   prior(normal(3.91, 0.1),class= Intercept), #mean = number of sessions and variance
+#   prior(normal(0, 0.02), class= b), # slope, a small effect size 
+#   prior(gamma(1.2, 0.01), class=shape)) #a variance
+
+
+priorNsession_aim5_baseline_stress <- c(
+  prior(normal(3.22, 0.05),class= Intercept), # mean = number of sessions and variance
+  prior(normal(0, 0.02), class= b), # slope, a small effect size on DASS
+  prior(gamma(1.5, 0.01), class=shape)) # a variance
+
+
+# Prior predictive check
+Baseline_stress_aim5_PriorCheck_m <- brm(
+  formula = Baseline_DASS_stress,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_stress,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+plot13 <- pp_check(Baseline_stress_aim5_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Prior predictive check") + theme_classic()
+pp_check(Baseline_stress_aim5_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Prior predictive check") 
+summary(Baseline_stress_aim5_PriorCheck_m)
+##ggsave("plot13.png", plot = plot13, width = 10, height = 8, dpi = 300)  
+plot13
+
+
+
+# Fitting the model
+Baseline_stress_aim5_m <- brm(
+  formula = Baseline_DASS_stress,
+  data = sample_total_aim5_baseline,
+  family = negbinomial(),
+  prior = priorNsession_aim5_baseline_stress,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+plot14 <- pp_check(Baseline_stress_aim5_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Posterior predictive check") + theme_classic()
+pp_check(Baseline_stress_aim5_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Posterior predictive check") 
+summary(Baseline_stress_aim5_m)
+##ggsave("plot14.png", plot = plot14, width = 10, height = 8, dpi = 300)  
+plot14
+
+
+# Results
+exp(0.01) #Estimate = 1.01
+exp(-0.01) # l-95% CI = 0.99
+exp(0.03) # u-95% CI = 1.03
+exp(0.01) # est. error = 1.01
+
+
+
+# Validity check
+
+# Chain check
+plot15 <- mcmc_trace(Baseline_stress_aim5_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, MCMC trace plot") + theme_classic()
+plot(Baseline_stress_aim5_m)
+ggsave("plot15.png", plot = plot15, width = 10, height = 8, dpi = 300)  
+plot15
+
+# Checking for overdispersion
+model.check_stress <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_stress_aim5_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_stress_aim5_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_stress
+plot(model.check_stress)
+testDispersion(model.check_stress)
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_stress_aim5_m, "baseline_DASS_21_Stress > 0")
+plot16 <- plot(hypothesis(Baseline_stress_aim5_m, "baseline_DASS_21_Stress > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 stress score
+on the number of practice sessions is positive") + theme_classic()
+##ggsave("plot16.png", plot = plot16, width = 10, height = 8, dpi = 300)
+plot16
+
+
+
+
+Stress_ce <- conditional_effects(Baseline_stress_aim5_m)
+p4 <- plot(Stress_ce)[[1]] + labs(title = "Stress",
+                  x = "Baseline DASS-21 Stress score",
+                  y = "Average Number of Sessions") +   geom_line(color = "black") + theme_classic()
+
+p4
+
+
+
+ # Marginal effects
+library(ggeffects)
+M_Stress <- ggpredict(Baseline_stress_aim5_m, "baseline_DASS_21_Stress", full.data = TRUE)
+print(M_Stress, n = Inf)
+
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_stress <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(13, 14), c(14, 15), c(15, 16), c(16, 17), c(17, 18),  c(18, 19))
+
+# Create an empty dataframe to store results
+result_df_Stress <- data.frame(
+  range_start = numeric(length = length(ranges_stress)),
+  range_end = numeric(length = length(ranges_stress)),
+  difference = numeric(length = length(ranges_stress))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_stress)) {
+  # Extract the current range
+  current_range <- ranges_stress[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_stress_aim5_m, 
+                    terms = c("baseline_DASS_21_Stress[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Stress$range_start[i] <- current_range[1]
+  result_df_Stress$range_end[i] <- current_range[2]
+  result_df_Stress$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Stress)
+
+# Calculate the mean of differences
+mean(result_df_Stress$difference) # 0.26
+
+
+
+```
+###### SF-12 Mental
+```{r, Aim 5: SF-12 Mental, N = 234}
+
+set.seed(556)
+# Model´s formula
+Baseline_SF12Mental <- bf(n_session ~ 1 + baseline_SF_12_Mental)
+mean(sample_total_aim5_baseline$n_session)
+sd(sample_total_aim5_baseline$n_session)
+
+# Priors
+priors_mental <- get_prior(Baseline_SF12Mental, family = skew_normal(), data=sample_total_aim5_baseline)
+priors_mental
+
+priorNsession_aim5_SF <- c(
+  prior(normal(25, 5),class= Intercept), # number of sessions
+  prior(normal(0, 0.8), class= b), # effect on SF scale
+  prior(normal(5, 1.1), class=sigma)) # variation
+
+
+# Prior predictive check
+Baseline_SF12Mental_PriorCheck_m <- brm(
+  formula = Baseline_SF12Mental,
+  data = sample_total_aim5_baseline,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+plot17 <- pp_check(Baseline_SF12Mental_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Prior predictive check") + theme_classic()
+
+pp_check(Baseline_SF12Mental_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Prior predictive check") 
+summary(Baseline_SF12Mental_PriorCheck_m)
+##ggsave("plot17.png", plot = plot17, width = 10, height = 8, dpi = 300)  
+plot17
+
+
+
+# Fitting the model
+Baseline_SF12Mental_m <- brm(
+  formula = Baseline_SF12Mental,
+  data = sample_total_aim5_baseline,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+plot18 <- pp_check(Baseline_SF12Mental_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Posterior predictive check") + theme_classic()
+pp_check(Baseline_SF12Mental_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Posterior predictive check") 
+summary(Baseline_SF12Mental_m)
+##ggsave("plot18.png", plot = plot18, width = 10, height = 8, dpi = 300)  
+plot18
+
+
+
+# Validity check
+
+# Chain check
+plot19 <- mcmc_trace(Baseline_SF12Mental_m) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, MCMC trace plot") + theme_classic()
+plot(Baseline_SF12Mental_m)
+ggsave("plot19.png", plot = plot19, width = 10, height = 8, dpi = 300)  
+plot19
+
+# Checking for overdispersion
+model.check_mental <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_SF12Mental_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_SF12Mental_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_mental
+plot(model.check_mental)
+testDispersion(model.check_mental)
+
+
+# Hypothesis testing
+hypothesis(Baseline_SF12Mental_m, "baseline_SF_12_Mental < 0")
+plot20 <- plot(hypothesis(Baseline_SF12Mental_m, "baseline_SF_12_Mental < 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline SF-12 mental score
+on the number of practice sessions is negative") 
+ggsave("plot20.png", plot = plot20, width = 10, height = 8, dpi = 300)  
+plot20
+
+
+SF12Mental_ce <- conditional_effects(Baseline_SF12Mental_m)
+p5 <- plot(SF12Mental_ce)[[1]] + labs(title = "Mental",
+                  x = "Baseline SF-12 Mental score",
+                  y = "Average Number of Sessions") + geom_line(color = "black") + theme_classic()
+
+p5
+
+
+
+
+```
+
+###### SF-12 Physical
+
+```{r, Aim 5: SF-12 Physical, N = 234}
+
+
+set.seed(476)
+# Model´s formula
+Baseline_SF12Physical <- bf(n_session ~ 1 + baseline_SF_12_Physical)
+
+# Priors
+priors_physical <- get_prior(Baseline_SF12Physical, family = skew_normal(), data=sample_total_aim5_baseline)
+priors_physical
+
+priorNsession_aim5_SF <- c(
+  prior(normal(25, 5),class= Intercept), # number of sessions
+  prior(normal(0, 0.8), class= b), # effect on SF scale
+  prior(normal(5, 1.1), class=sigma)) # variation
+
+# priorNsession_aim5_SF <- c(
+#   prior(normal(29, 6.6),class= Intercept), 
+#   prior(normal(0, 0.5), class= b),
+#   prior(normal(15, 0.01), class=sigma))
+
+
+
+# Prior predictive check
+Baseline_SF12Physical_PriorCheck_m <- brm(
+  formula = Baseline_SF12Physical,
+  data = sample_total_aim5_baseline,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 12, adapt_delta = 0.99)
+)
+
+plot21 <- pp_check(Baseline_SF12Physical_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Prior predictive check") + theme_classic()
+
+pp_check(Baseline_SF12Physical_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Prior predictive check") 
+summary(Baseline_SF12Physical_PriorCheck_m)
+##ggsave("plot21.png", plot = plot21, width = 10, height = 8, dpi = 300)  
+plot21
+
+
+
+# Fitting the model
+Baseline_SF12Physical_m <- brm(
+  formula = Baseline_SF12Physical,
+  data = sample_total_aim5_baseline,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 8000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+# Posterior predictive check
+plot22 <- pp_check(Baseline_SF12Physical_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Posterior predictive check") + theme_classic()
+pp_check(Baseline_SF12Physical_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Posterior predictive check") 
+summary(Baseline_SF12Physical_m)
+##ggsave("plot22.png", plot = plot22, width = 10, height = 8, dpi = 300)  
+plot22
+
+
+
+#Validity check
+
+# Chain check
+plot23 <- mcmc_trace(Baseline_SF12Physical_m) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, MCMC trace plot") + theme_classic()
+plot(Baseline_SF12Physical_m)
+ggsave("plot23.png", plot = plot23, width = 10, height = 8, dpi = 300)  
+plot23
+
+
+# Checking for overdispersion
+model.check_physical <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_SF12Physical_m)),
+  observedResponse = sample_total_aim5_baseline$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_SF12Physical_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_physical
+plot(model.check_physical)
+testDispersion(model.check_physical)
+
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_SF12Physical_m, "baseline_SF_12_Physical > 0")
+plot24 <- plot(hypothesis(Baseline_SF12Physical_m, "baseline_SF_12_Physical > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline SF-12 physical score
+on the number of practice sessions is negative") 
+ggsave("plot24.png", plot = plot24, width = 10, height = 8, dpi = 300)  
+plot24
+
+
+SF12Physical_ce <- conditional_effects(Baseline_SF12Physical_m)
+p6 <- plot(SF12Physical_ce)[[1]] + labs(title = "Physical",
+                  x = "Baseline SF-12 Physical score",
+                  y = "Average Number of Sessions") + geom_line(color = "black") + theme_classic()
+
+p6
+
+
+
+
+```
+###### Grid plots
+
+```{r, Aim 5: DASS & SF grid plots, N = 234}
+
+# DASS-21 conditional effects grid plot
+p_grid_DASS_SF <- ggarrange(
+  p1,
+  p2,
+  p3,
+  p4,
+  p5,
+  p6,
+  ncol = 2,
+  nrow = 3,
+  labels = c("A", "B", "C", "D", "E", "F"))
+p_grid_DASS_SF
+
+ggsave("p_grid_DASS_SF.tiff", plot = p_grid_DASS_SF, width = 10, height = 8, dpi = 300) 
+
+
+# SF-12 conditional effects grid plot
+p_grid_SF <-  ggarrange(
+  p5,
+  p6,
+  nrow = 1,
+  ncol = 2,
+  labels = c("A", "B"))
+p_grid_SF
+
+ggsave("p_grid_SF.png", plot = p_grid_SF, width = 14, height = 8, dpi = 300) 
+
+```
+
+
+
+
+
+### Aim 5 (N = 81): Baseline DASS-21 and SF-12 scores and amount of Practice 
+
+
+###### DASS-21 Total
+```{r, Aim 5: DASS-21 total}
+
+
+
+# Model´s formula
+Baseline_DASS_total <- bf(n_session ~ 1 + baseline_DASS_21_total)
+
+# Priors
+priors_baseline <- get_prior(Baseline_DASS_total, family = poisson(link = "log"), data=wide_data)
+priors_baseline
+
+mean(wide_data$n_session)
+sd(wide_data$n_session)
+
+# log of mean
+log(29) #3.36
+log(1) #0
+exp(1.12)
+
+
+
+priorNsession_aim5 <- c(
+  prior(normal(3.36, 1.12),class= Intercept), 
+  prior(normal(0, 0.09), class= b),
+  prior(gamma(1, 0.03), class=shape))
+
+
+
+# Prior predictive check
+Baseline_total_PriorCheck_m <- brm(
+  formula = Baseline_DASS_total,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_total_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Prior predictive check") 
+pp_check(Baseline_total_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Prior predictive check")
+summary(Baseline_total_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_total_m <- brm(
+  formula = Baseline_DASS_total,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+pp_check(Baseline_total_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_total,
+Posterior predictive check") 
+pp_check(Baseline_total_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_total, 
+Posterior predictive check") 
+summary(Baseline_total_m)
+
+
+
+
+# Validity check
+
+# Chain check
+mcmc_trace(Baseline_total_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_total")
+plot(Baseline_total_m)
+
+
+# Checking for overdispersion
+model.check_total <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_total_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_total_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_total
+plot(model.check_total)
+testDispersion(model.check_total)
+
+
+# Hypothesis testing
+hypothesis(Baseline_total_m, "baseline_DASS_21_total > 0")
+plot(hypothesis(Baseline_total_m, "baseline_DASS_21_total > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 total score
+on the number of home-practiced sessions is positive") 
+
+
+Total_ce <- conditional_effects(Baseline_total_m)
+p1 <- plot(Total_ce)[[1]] + labs(title = "Total",
+                  x = "Baseline DASS-21 Total score",
+                  y = "Average Number of Sessions") + geom_line(color = "black")+ theme_classic()
+
+p1
+
+# Results
+
+exp(0.01) #1.01
+exp(-0.01) #0.99
+exp(0.02) #1.02
+ 
+         
+
+# Marginal effects
+library(ggeffects)
+M_total <- ggpredict(Baseline_total_m, "baseline_DASS_21_total", full.data = TRUE)
+print(M_total, n = Inf)
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_total <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(10, 11), c(11, 12), c(12, 13), c(13, 14), c(14, 15), c(15, 16), c(16, 17), c(17, 18), c(18, 19), c(19, 20), c(20, 21), c(21, 22), c(22, 23), c(23, 24), c(24, 25), c(25, 26), c(26, 27), c(27, 28), c(28, 29), c(29, 30), c(30, 31), c(31, 32), c(32, 33), c(33, 34), c(34, 35), c(35, 36), c(36, 37), c(37, 38), c(38, 39), c(39, 40), c(40, 41), c(41, 42), c(42, 43), c(43, 44), c(44, 45),c(45, 46))
+
+
+result_df_Total <- data.frame(
+  range_start = seq(0, 45),    # Vary every digit from 0 to 23
+  range_end = seq(1, 46),       # Corresponding end values
+  difference = numeric(length = 46)  # Assuming 24 rows based on the specified range
+)
+
+# Loop through each range
+for (i in seq_along(ranges_total)) {
+  # Extract the current range
+  current_range <- ranges_total[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_total_m, 
+                    terms = c("baseline_DASS_21_total[current_range]"))
+  
+  # Calculate the difference and store it in the result dataframe
+  result_df_Total$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Total)
+
+# calculate the mean of differences
+mean(result_df_Total$difference) #0.220
+
+
+
+
+```
+
+
+###### DASS-21 Depression
+```{r, Aim 5: DASS-21 Depression}
+
+
+# Model´s formula
+Baseline_DASS_depression <- bf(n_session ~ 1 + baseline_DASS_21_Depression)
+
+# Priors
+priors_depression <- get_prior(Baseline_DASS_depression, family = negbinomial(link = "log"), data=wide_data)
+priors_depression
+
+
+# log of mean
+log(29) #3.36
+log(60) #0
+exp(1.12)
+
+priorNsession_aim5 <- c(
+  prior(normal(3.36, 1.12),class= Intercept), 
+  prior(normal(0, 0.09), class= b),
+  prior(gamma(1, 0.03), class=shape))
+
+
+
+
+# Prior predictive check
+Baseline_depression_PriorCheck_m <- brm(
+  formula = Baseline_DASS_depression,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_depression_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Prior predictive check") 
+
+pp_check(Baseline_depression_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Prior predictive check") 
+summary(Baseline_depression_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_depression_m <- brm(
+  formula = Baseline_DASS_depression,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+pp_check(Baseline_depression_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Posterior predictive check") 
+pp_check(Baseline_depression_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, 
+Posterior predictive check") 
+summary(Baseline_depression_m)
+
+
+
+# Validity check
+
+# Chain check
+mcmc_trace(Baseline_depression_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Depression, MCMC trace plot")
+plot(Baseline_depression_m)
+
+# Checking for overdispersion
+model.check_depression <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_depression_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_depression_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_depression
+plot(model.check_depression)
+testDispersion(model.check_depression)
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_depression_m, "baseline_DASS_21_Depression > 0")
+plot(hypothesis(Baseline_depression_m, "baseline_DASS_21_Depression > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 depression score
+on the number of home-practiced sessions is positive") 
+
+
+Depression_ce <- conditional_effects(Baseline_depression_m)
+p2 <- plot(Depression_ce)[[1]] + labs(title = "Depression",
+                  x = "Baseline DASS-21 Depression score",
+                  y = "Average Number of Sessions") +   geom_line(color = "black")+ theme_classic()
+
+p2
+
+# Results
+exp(0.02) #1.01
+exp(-0.02) #0.98
+exp(0.05) #1.05
+
+
+# Marginal effects
+library(ggeffects)
+M_Depression <- ggpredict(Baseline_depression_m, "baseline_DASS_21_Depression", full.data = TRUE)
+print(M_Depression, n = Inf)
+
+# Average marginal effects ( creating a loop calculate an average)
+# Specify the ranges
+ranges_depression <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(12, 13), c(13, 14), c(14, 15))
+
+# Create an empty dataframe to store results
+result_df_Depression <- data.frame(
+  range_start = numeric(length = length(ranges_depression)),
+  range_end = numeric(length = length(ranges_depression)),
+  difference = numeric(length = length(ranges_depression))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_depression)) {
+  # Extract the current range
+  current_range <- ranges_depression[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_depression_m, 
+                    terms = c("baseline_DASS_21_Depression[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Depression$range_start[i] <- current_range[1]
+  result_df_Depression$range_end[i] <- current_range[2]
+  result_df_Depression$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Depression)
+
+# Calculate the mean of differences
+mean(result_df_Depression$difference) #0.434
+
+
+```
+
+
+
+###### DASS-21 Anxiety
+```{r, Aim 5: DASS-21 Anxiety}
+
+
+# Model´s formula
+Baseline_DASS_anxiety <- bf(n_session ~ 1 + baseline_DASS_21_Anxiety)
+
+# Priors
+priors_anxiety <- get_prior(Baseline_DASS_anxiety, family = negbinomial(link = "log"), data=wide_data)
+priors_anxiety
+
+
+# log of mean
+log(29) #3.36
+log(1) #0
+
+
+priorNsession_aim5 <- c(
+  prior(normal(3.36, 1.12),class= Intercept), 
+  prior(normal(0, 0.09), class= b),
+  prior(gamma(1, 0.03), class=shape))
+
+
+
+# Prior predictive check
+Baseline_anxiety_PriorCheck_m <- brm(
+  formula = Baseline_DASS_anxiety,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_anxiety_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Prior predictive check") 
+pp_check(Baseline_anxiety_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Prior predictive check") 
+summary(Baseline_anxiety_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_anxiety_m <- brm(
+  formula = Baseline_DASS_anxiety,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+pp_check(Baseline_anxiety_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Posterior predictive check") 
+pp_check(Baseline_anxiety_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, 
+Posterior predictive check") 
+summary(Baseline_anxiety_m)
+
+
+
+# Validity check
+
+# Chain check
+mcmc_trace(Baseline_anxiety_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Anxiety, MCMC trace plot")
+plot(Baseline_anxiety_m)
+
+# Checking for overdispersion
+model.check_anxiety <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_anxiety_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_anxiety_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_anxiety
+plot(model.check_anxiety)
+testDispersion(model.check_anxiety)
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_anxiety_m, "baseline_DASS_21_Anxiety < 0")
+plot(hypothesis(Baseline_anxiety_m, "baseline_DASS_21_Anxiety < 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 anxiety score
+on the number of home-practiced sessions is negative") 
+
+Anxiety_ce <- conditional_effects(Baseline_anxiety_m)
+p3 <- plot(Anxiety_ce)[[1]] + labs(title = "Anxiety",
+                  x = "Baseline DASS-21 Anxiety score",
+                  y = "Average Number of Sessions") +   geom_line(color = "black") + theme_classic()
+
+p3
+
+
+# Results
+exp(-0.00) #1
+exp(-0.04) #0.96
+exp( 0.04) #1.04
+exp(0.02)  #1.02
+ 
+
+# Marginal effects
+library(ggeffects)
+M_Anxiety <- ggpredict(Baseline_anxiety_m, "baseline_DASS_21_Anxiety", full.data = TRUE)
+print(M_Anxiety, n = Inf)
+
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_anxiety <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(13, 14))
+
+# Create an empty dataframe to store results
+result_df_Anxiety <- data.frame(
+  range_start = numeric(length = length(ranges_anxiety)),
+  range_end = numeric(length = length(ranges_anxiety)),
+  difference = numeric(length = length(ranges_anxiety))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_anxiety)) {
+  # Extract the current range
+  current_range <- ranges_anxiety[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_anxiety_m, 
+                    terms = c("baseline_DASS_21_Anxiety[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Anxiety$range_start[i] <- current_range[1]
+  result_df_Anxiety$range_end[i] <- current_range[2]
+  result_df_Anxiety$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Anxiety)
+
+# Calculate the mean of differences
+mean(result_df_Anxiety$difference) # -0.0483
+
+```
+
+
+###### DASS-21 Stress
+```{r, Aim 5: DASS-21 Stress}
+
+
+# Model´s formula
+Baseline_DASS_stress <- bf(n_session ~ 1 + baseline_DASS_21_Stress)
+
+# Priors
+priors_stress <- get_prior(Baseline_DASS_stress, family = negbinomial(link = "log"), data=wide_data)
+priors_stress
+
+# log of mean
+log(29) #3.36
+log(1) #0
+
+
+priorNsession_aim5 <- c(
+  prior(normal(3.36, 1.12),class= Intercept), 
+  prior(normal(0, 0.09), class= b),
+  prior(gamma(1, 0.03), class=shape))
+
+
+
+
+# Prior predictive check
+Baseline_stress_PriorCheck_m <- brm(
+  formula = Baseline_DASS_stress,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_stress_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Prior predictive check") 
+pp_check(Baseline_stress_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Prior predictive check") 
+summary(Baseline_stress_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_stress_m <- brm(
+  formula = Baseline_DASS_stress,
+  data = wide_data,
+  family = negbinomial(),
+  prior = priorNsession_aim5,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+pp_check(Baseline_stress_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Posterior predictive check") 
+pp_check(Baseline_stress_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, 
+Posterior predictive check") 
+summary(Baseline_stress_m)
+
+
+
+# Validity check
+
+# Chain check
+mcmc_trace(Baseline_stress_m) + ggtitle("n_session ~ 1 + baseline_DASS_21_Stress, MCMC trace plot")
+plot(Baseline_stress_m)
+
+# Checking for overdispersion
+model.check_stress <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_stress_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_stress_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_stress
+plot(model.check_stress)
+testDispersion(model.check_stress)
+
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_stress_m, "baseline_DASS_21_Stress > 0")
+plot(hypothesis(Baseline_stress_m, "baseline_DASS_21_Stress > 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline DASS-21 stress score
+on the number of home-practiced sessions is positive") 
+
+
+Stress_ce <- conditional_effects(Baseline_stress_m)
+p4 <- plot(Stress_ce)[[1]] + labs(title = "Stress",
+                  x = "Baseline DASS-21 Stress score",
+                  y = "Average Number of Sessions") + geom_line(color = "black") + theme_classic()
+
+p4
+
+
+# Results
+exp(0.03) #1.03
+exp(-0.00) #1
+exp(0.06) #1.06
+exp(0.02)
+
+
+
+# Marginal effects
+library(ggeffects)
+M_Stress <- ggpredict(Baseline_stress_m, "baseline_DASS_21_Stress", full.data = TRUE)
+print(M_Stress, n = Inf)
+
+
+# Average marginal effects ( creating a loop calculate an average)
+
+# Define the ranges
+ranges_stress <- list(c(0, 1), c(1, 2), c(2, 3), c(3, 4), c(4, 5), c(5, 6), c(6, 7), c(7, 8), c(8, 9), c(9, 10), c(13, 14), c(14, 15), c(15, 16), c(16, 17), c(17, 18),  c(18, 19))
+
+# Create an empty dataframe to store results
+result_df_Stress <- data.frame(
+  range_start = numeric(length = length(ranges_stress)),
+  range_end = numeric(length = length(ranges_stress)),
+  difference = numeric(length = length(ranges_stress))
+)
+
+# Loop through each range
+for (i in seq_along(ranges_stress)) {
+  # Extract the current range
+  current_range <- ranges_stress[[i]]
+  
+  # Calculate the predicted values for the current range
+  pr_A <- ggpredict(Baseline_stress_m, 
+                    terms = c("baseline_DASS_21_Stress[current_range]"))
+  
+  # Store the range and difference in the result dataframe
+  result_df_Stress$range_start[i] <- current_range[1]
+  result_df_Stress$range_end[i] <- current_range[2]
+  result_df_Stress$difference[i] <- round(diff(pr_A$predicted), 4)
+}
+
+# Print the result dataframe
+print(result_df_Stress)
+
+# Calculate the mean of differences
+mean(result_df_Stress$difference) # 0.81
+```
+
+
+###### SF-12 Mental
+```{r, Aim 5: SF-12 Mental}
+
+# Model´s formula
+Baseline_SF12Mental <- bf(n_session ~ 1 + baseline_SF_12_Mental)
+
+# Priors
+priors_mental <- get_prior(Baseline_SF12Mental, family = skew_normal(), data=wide_data)
+priors_mental
+
+priorNsession_aim5_SF <- c(
+  prior(normal(29, 6.6),class= Intercept), 
+  prior(normal(0, 0.5), class= b),
+  prior(normal(15, 0.01), class=sigma))
+
+
+# Prior predictive check
+Baseline_SF12Mental_PriorCheck_m <- brm(
+  formula = Baseline_SF12Mental,
+  data = wide_data,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_SF12Mental_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Prior predictive check") 
+
+pp_check(Baseline_SF12Mental_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Prior predictive check") 
+summary(Baseline_SF12Mental_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_SF12Mental_m <- brm(
+  formula = Baseline_SF12Mental,
+  data = wide_data,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# Posterior predictive check
+pp_check(Baseline_SF12Mental_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Posterior predictive check") 
+pp_check(Baseline_SF12Mental_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, 
+Posterior predictive check") 
+summary(Baseline_SF12Mental_m)
+
+
+
+# Validity check
+
+# Chain check
+mcmc_trace(Baseline_SF12Mental_m) + ggtitle("n_session ~ 1 + baseline_SF_12_Mental, MCMC trace plot")
+plot(Baseline_SF12Mental_m)
+
+# Checking for overdispersion
+model.check_mental <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_SF12Mental_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_SF12Mental_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_mental
+plot(model.check_mental)
+testDispersion(model.check_mental)
+
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_SF12Mental_m, "baseline_SF_12_Mental < 0")
+plot(hypothesis(Baseline_SF12Mental_m, "baseline_SF_12_Mental < 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline SF-12 mental score
+on the number of home-practiced sessions is negative") 
+
+
+SF12Mental_ce <- conditional_effects(Baseline_SF12Mental_m)
+p5 <- plot(SF12Mental_ce)[[1]] + labs(title = "Mental",
+                  x = "Baseline SF-12 Mental score",
+                  y = "Average Number of Sessions") + geom_line(color = "black") + theme_classic()
+
+p5
+
+
+
+
+```
+
+
+```{r}
+exp(-0.03)
+```
+
+###### SF-12 Physical
+
+```{r, Aim 5: SF-12 Physical}
+
+# Model´s formula
+Baseline_SF12Physical <- bf(n_session ~ 1 + baseline_SF_12_Physical)
+
+# Priors
+priors_physical <- get_prior(Baseline_SF12Physical, family = skew_normal(), data=wide_data)
+priors_physical
+
+
+priorNsession_aim5_SF <- c(
+  prior(normal(29, 6.6),class= Intercept), 
+  prior(normal(0, 0.5), class= b),
+  prior(normal(15, 0.01), class=sigma))
+
+
+
+# Prior predictive check
+Baseline_SF12Physical_PriorCheck_m <- brm(
+  formula = Baseline_SF12Physical,
+  data = wide_data,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 12, adapt_delta = 0.99)
+)
+
+pp_check(Baseline_SF12Physical_PriorCheck_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Prior predictive check") 
+
+pp_check(Baseline_SF12Physical_PriorCheck_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Prior predictive check") 
+summary(Baseline_SF12Physical_PriorCheck_m)
+
+
+
+
+# Fitting the model
+Baseline_SF12Physical_m <- brm(
+  formula = Baseline_SF12Physical,
+  data = wide_data,
+  family = skew_normal(),
+  prior = priorNsession_aim5_SF,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 8000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.99)
+)
+
+# Posterior predictive check
+pp_check(Baseline_SF12Physical_m, nsamples = 100) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Posterior predictive check") 
+pp_check(Baseline_SF12Physical_m, nsamples = 100, type = "stat") + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, 
+Posterior predictive check") 
+summary(Baseline_SF12Physical_m)
+
+
+
+
+#Validity check
+
+# Chain check
+mcmc_trace(Baseline_SF12Physical_m) + ggtitle("n_session ~ 1 + baseline_SF_12_Physical, MCMC trace plot")
+plot(Baseline_SF12Physical_m)
+
+# Checking for overdispersion
+model.check_physical <- createDHARMa(
+  simulatedResponse = t(posterior_predict(Baseline_SF12Physical_m)),
+  observedResponse = wide_data$n_session,
+  fittedPredictedResponse = apply(t(posterior_epred(Baseline_SF12Physical_m)), 1, mean),
+  integerResponse = TRUE)
+
+model.check_physical
+plot(model.check_physical)
+testDispersion(model.check_physical)
+
+
+
+
+# Hypothesis testing
+hypothesis(Baseline_SF12Physical_m, "baseline_SF_12_Physical < 0")
+plot(hypothesis(Baseline_SF12Physical_m, "baseline_SF_12_Physical < 0"))[[1]] + theme_classic() + ggtitle("Hypothesis testing: the effect of baseline SF-12 physical score
+on the number of home-practiced sessions is negative") 
+
+
+SF12Physical_ce <- conditional_effects(Baseline_SF12Physical_m)
+p6 <- plot(SF12Physical_ce)[[1]] + labs(title = "Physical",
+                  x = "Baseline SF-12 Physical score",
+                  y = "Average Number of Sessions") + geom_line(color = "black") + theme_classic()
+
+p6
+
+
+
+
+```
+
+###### Grid plots
+
+```{r, Aim 5: DASS & SF grid plots}
+
+# DASS-21 conditional effects grid plot
+p_grid_DASS <- ggarrange(
+  p1,
+  p2,
+  p3,
+  p4,
+  ncol = 2,
+  nrow = 2,
+  labels = c("A", "B", "C", "D"))
+p_grid_DASS
+
+
+
+
+# add the title
+
+# title <- ggdraw() + 
+#   draw_label(
+#     "Estimated associations between baseline DASS-21 scores of each dimension and the amount of home-practiced
+#     sessions",
+#     x = 0,
+#     size = 16,
+#     hjust = 0
+#   ) +
+#   theme(
+#     # add margin on the left of the drawing canvas,
+#     # so title is aligned with left edge of first plot
+#     plot.margin = margin(0, 0, 0, 7)
+#   )
+# 
+# # final grid with the title
+# plot_grid(
+#   title, p_grid,
+#   ncol = 1,
+#   # rel_heights values control vertical title margins
+#   rel_heights = c(0.1, 1)
+# )
+
+
+# SF-12 conditional effects grid plot
+p_grid_SF <-  ggarrange(
+  p5,
+  p6,
+  nrow = 1,
+  ncol = 2,
+  labels = c("A", "B"))
+p_grid_SF
+
+
+
+# DASS-21 conditional effects grid plot
+p_grid_combined <- ggarrange(
+  p1,
+  p2,
+  p3,
+  p4,
+  p5,
+  p6,
+  ncol = 2,
+  nrow = 3,
+  labels = c("A", "B", "C", "D", "E", "F"))
+p_grid_combined
+
+
+
+```
+
+
+
+
+### Aim 6: Associations between practice sessions and subsequent DASS-21 and SF-12 scores
+
+###### DASS-21 Total
+```{r, Aim 6: DASS-21 total}
+
+set.seed(965)
+# Model´s formula
+Follow_up_DASS_total <- bf(follow_up_DASS_21_total ~ baseline_DASS_21_total + n_session)
+
+#summary
+mean(wide_data$follow_up_DASS_21_total) #10.9
+sd(wide_data$follow_up_DASS_21_total) #8.1
+
+# priors
+priorFollow_up_DASS_total <- c(
+  prior(normal(11, 2),class= Intercept), # sd to cover the whole range of data (1 sd is 8.1 in the data)
+  prior(normal(0, 0.2), class= b), #we intend to explore the difference, no prior expectation
+  prior(normal(.2, .1), class = sigma)
+  )
+
+
+# Prior predictive check
+Follow_up_DASS_total_PriorCheck_m <- brm(
+  formula = Follow_up_DASS_total,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_DASS_total,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+# plots and summary
+plot25 <- pp_check(Follow_up_DASS_total_PriorCheck_m, nsamples = 100)  + ggtitle("follow-up DASS-21 total ~ baseline DASS-21 total + n_session, Prior predictive check") + theme_classic()
+pp_check(Follow_up_DASS_total_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_DASS_total_PriorCheck_m)
+ggsave("plot25.png", plot = plot25, width = 10, height = 8, dpi = 300) 
+plot25
+
+
+# Fitting the model
+Follow_up_DASS_total_m <- brm(
+  formula = Follow_up_DASS_total,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_DASS_total,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+# plots and summary
+plot26 <- pp_check(Follow_up_DASS_total_m, nsamples = 100) + ggtitle("follow-up DASS-21 total ~ baseline DASS-21 total + n_session, 
+Posterior predictive check") + theme_classic()
+pp_check(Follow_up_DASS_total_m, nsamples = 100, type = "stat")
+pp_check(Follow_up_DASS_total_m, type = "ribbon")
+summary(Follow_up_DASS_total_m)
+ggsave("plot26.png", plot = plot26, width = 10, height = 8, dpi = 300) 
+
+
+
+#Validity check
+
+# Chain check
+library(bayesplot)
+plot28 <- mcmc_trace(Follow_up_DASS_total_m) + ggtitle("follow-up DASS-21 total ~ baseline DASS-21 total + n_session, MCMC trace plot") + theme_classic()
+plot(Follow_up_DASS_total_m)
+ggsave("plot28.png", plot = plot28, width = 10, height = 8, dpi = 300) 
+
+
+# Hypothesis testing
+hypothesis(Follow_up_DASS_total_m, "n_session < 0") 
+plot27 <- plot(hypothesis(Follow_up_DASS_total_m, "n_session < 0"))[[1]] + ggtitle("Hypothesis testing: the effect of practice sessions
+on DASS-21 total follow-up scores is negative") + theme_classic()
+ggsave("plot27.png", plot = plot27, width = 10, height = 8, dpi = 300) 
+
+
+# Conditional effects (Ce)
+Follow_up_DASS_total_ce <- conditional_effects(Follow_up_DASS_total_m, spaghetti = TRUE, nsamples = 100, categorical = F)
+# Plotting Ce with data points
+plot(Follow_up_DASS_total_ce, points = T)[[2]] + labs(title = "follow-up DASS-21 total ~ baseline DASS-21 total + n_session") + theme_minimal()
+# without data points
+Follow_up_DASS_total_ce <- conditional_effects(Follow_up_DASS_total_m, categorical = F)
+p1 <- plot(Follow_up_DASS_total_ce)[[2]] + labs(title = "DASS-21 total",
+                                         x = "Number of sessions",
+                                         y = "Follow up DASS-21") +                                                                                                     theme_classic() +
+                                         scale_color_discrete(name = "DASS-21 total score") +
+                                         scale_fill_discrete(name = "DASS-21 total score")
+
+# Displaying the plot
+p1
+
+
+# Plotting the results (extracting results from the model results)
+  ## extracting the data from the conditional_effects object
+term_total <-  conditional_effects(Follow_up_DASS_total_m)$n_session
+term_total
+
+
+aim6_DASStotal <- ggplot(term_total) +                                                                      
+  geom_line(color='black',data = term_total, aes(x=n_session, y=estimate__)) +     # predicted line of multiple linear regression
+  geom_ribbon(aes(x=n_session, y=estimate__, xmin = 0, xmax= 70, ymin = lower__, ymax = upper__), alpha = 0.2) +
+  geom_point(data = wide_data, aes(n_session, follow_up_DASS_21_total)) + # follow up scores after the MBSR +
+  xlab("Number of practice sessions") +
+  ylab("DASS-21 total") +
+  theme_classic()
+  
+ggsave("aim6_DASStotal.png", plot = aim6_DASStotal, width = 10, height = 8, dpi = 300)  
+
+
+```
+
+###### DASS-21 Depression
+```{r, Aim 6: DASS-21 depression}
+
+set.seed(703)
+# Model´s formula
+Follow_up_depression <- bf(follow_up_DASS_21_Depression ~ baseline_DASS_21_Depression + n_session)
+
+
+## Priors
+priors <- get_prior(Follow_up_depression, family = gaussian(), data=wide_data)
+
+# Data summary
+mean(wide_data$follow_up_DASS_21_Depression) #3.3
+sd(wide_data$follow_up_DASS_21_Depression) #3.7
+
+# priors on a normal scale ((based on the data: mean and sd of the follow-up questionnaire score))
+priorFollow_up_score_depression <- c(
+  prior(normal(3.3, 0.5),class= Intercept), # sd to cover the whole range of data (1 sd is 3.3 in the data)
+  prior(normal(0, .2), class= b),  #we intend to explore the difference, no prior expectation
+  prior(normal(.1, .05), class = sigma) 
+)
+
+# Prior predictive check
+Follow_up_depression_PriorCheck_m <- brm(
+  formula = Follow_up_depression,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_depression,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+plot29 <- pp_check(Follow_up_depression_PriorCheck_m, nsamples = 100) + ggtitle("follow-up DASS-21 Depression ~ baseline DASS-21 Depression + n_session, 
+Prior predictive check") + theme_classic()
+
+pp_check(Follow_up_depression_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_depression_PriorCheck_m)
+ggsave("plot29.png", plot = plot29, width = 10, height = 8, dpi = 300) 
+
+plot29 
+
+# Fitting the model
+Follow_up_depression_m <- brm(
+  formula = Follow_up_depression,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_depression,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+plot30 <- pp_check(Follow_up_depression_m, nsamples = 100) + ggtitle("follow-up DASS-21 Depression ~ baseline DASS-21 Depression + n_session,
+Posterior predictive check") + theme_classic()
+pp_check(Follow_up_depression_m, nsamples = 100, type = "stat")
+summary(Follow_up_depression_m)
+ggsave("plot30.png", plot = plot30, width = 10, height = 8, dpi = 300) 
+plot30
+
+# Validity check
+
+# Chain check
+library(bayesplot)
+plot31 <- mcmc_trace(Follow_up_depression_m) + ggtitle("follow-up DASS-21 depression ~ baseline DASS-21 depression + n_session, 
+MCMC trace plot") + theme_classic()
+plot(Follow_up_depression_m)
+ggsave("plot31.png", plot = plot31, width = 10, height = 8, dpi = 300) 
+
+
+# Hypothesis testing
+hypothesis(Follow_up_depression_m, "n_session < 0") 
+plot32 <- plot(hypothesis(Follow_up_depression_m, "n_session < 0"))[[1]] + ggtitle("Hypothesis testing: the effect of practiced number of sessions
+on depression level is negative") + theme_classic()
+ggsave("plot32.png", plot = plot32, width = 10, height = 8, dpi = 300) 
+
+########### PLOTING ########### 
+
+# Plot with colored background
+
+# extract the data from the conditional_effects object
+term_depression <-  conditional_effects(Follow_up_depression_m)$n_session
+term_depression
+
+# create data with breaks (based on DASS depression severity levels; requires multiplying data by 2)
+data_breaks_depression <- data.frame(start = c(0, 10, 14, 21, 28),  
+                          end = c(10, 14, 21, 28, 36),
+                          Severity = forcats::fct_inorder(c("normal", "mild", "moderate", "severe", "extremely severe")))
+# print data with breaks
+data_breaks_depression                                    
+
+
+# final plot
+DASS_p3 <- ggplot(term_depression) +                                                                      
+  geom_rect(data = data_breaks_depression,                                                 # Add background colors to plot
+            aes(xmin = 0, 
+                xmax = 67,
+                ymin = start,
+                ymax = end,
+                fill =  Severity),
+            alpha = 0.5) + 
+  
+  scale_fill_manual(values = c("green", "yellow", "orange", "red", "darkred")) +
+  geom_line(color='black',data = term_depression, aes(x=n_session, y=estimate__*2)) +     # predicted line of multiple linear regression
+  geom_ribbon(aes(x=n_session, y=estimate__*2, xmin = 0, xmax= 70, ymin = lower__*2, ymax = upper__*2), alpha = 0.2) +
+  geom_point(data = wide_data, aes(n_session, follow_up_DASS_21_Depression *2)) + # follow up scores after the MBSR
+  ggtitle("DASS-21 depression") +
+  xlab("Number of practice sessions") +
+  ylab("DASS-21 depression follow-up score") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 18), plot.title = element_text(size = 26)) +     theme(legend.position="none")
+
+
+# display the plot
+DASS_p3
+
+ggsave("color_DASS_p3.png", plot = DASS_p3, width = 10, height = 8, dpi = 300) 
+
+
+```
+
+###### DASS-21 Anxiety
+```{r, Aim 6: DASS-21 anxiety}
+
+set.seed(388)
+# Model´s formula
+Follow_up_anxiety <- bf(follow_up_DASS_21_Anxiety ~ baseline_DASS_21_Anxiety + n_session)
+
+## Priors
+priors <- get_prior(Follow_up_anxiety, family = gaussian(), data=wide_data)
+priors
+
+# Data summary
+mean(wide_data$follow_up_DASS_21_Anxiety) #1.9
+sd(wide_data$follow_up_DASS_21_Anxiety) #2.3
+
+# Priors on a normal scale (based on the data: mean and sd of the follow-up questionnaire score)
+priorFollow_up_score_anxiety <- c(
+    prior(normal(1.9, 1),class= Intercept), # sd to cover the whole range of data (1 sd is 2.3 in the data)
+    prior(normal(0, 0.2), class= b), #we intend to explore the difference, no prior expectation
+    prior(normal(.1, .05), class = sigma)
+    )
+
+
+
+# Prior predictive check
+Follow_up_anxiety_PriorCheck_m <- brm(
+  formula = Follow_up_anxiety,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_anxiety,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+plot33 <- pp_check(Follow_up_anxiety_PriorCheck_m, nsamples = 100) + ggtitle("follow-up DASS-21 Anxiety ~ baseline DASS-21 Anxiety + n_session, 
+Prior predictive check") + theme_classic()
+
+pp_check(Follow_up_anxiety_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_anxiety_PriorCheck_m)
+ggsave("plot33.png", plot = plot33, width = 10, height = 8, dpi = 300) 
+plot33
+
+# Fitting the model
+Follow_up_anxiety_m <- brm(
+  formula = Follow_up_anxiety,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_anxiety,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+plot34 <- pp_check(Follow_up_anxiety_m, nsamples = 100) + ggtitle("follow-up DASS-21 Anxiety ~ baseline DASS-21 Anxiety + n_session,
+Posterior predictive check") + theme_classic()
+pp_check(Follow_up_anxiety_m, nsamples = 100, type = "stat")
+summary(Follow_up_anxiety_m)
+ggsave("plot34.png", plot = plot34, width = 10, height = 8, dpi = 300) 
+plot34
+
+
+# Validity check
+
+# Chain check
+library(bayesplot)
+plot35 <- mcmc_trace(Follow_up_anxiety_m) + ggtitle("follow-up DASS-21 anxiety ~ baseline DASS-21 anxiety + n_session, MCMC trace plot") + theme_classic()
+plot(Follow_up_anxiety_m)
+ggsave("plot35.png", plot = plot35, width = 10, height = 8, dpi = 300) 
+
+
+
+# Hypothesis testing
+hypothesis(Follow_up_anxiety_m, "n_session > 0") 
+plot(hypothesis(Follow_up_anxiety_m, "n_session > 0"))[[1]] + ggtitle("Hypothesis testing: the effect of home-practiced number of sessions
+on anxiety level is positive") + theme_classic()
+
+# Hypothesis testing
+hypothesis(Follow_up_anxiety_m, "n_session < 0") 
+plot36 <- plot(hypothesis(Follow_up_anxiety_m, "n_session < 0"))[[1]] + ggtitle("Hypothesis testing: the effect of home-practiced number of sessions
+on anxiety level is negative") + theme_classic()
+ggsave("plot36.png", plot = plot36, width = 10, height = 8, dpi = 300) 
+
+
+
+########### PLOTING ########### 
+
+# Plot with colored background
+
+# extract the data from the conditional_effects object
+term_anxiety <-  conditional_effects(Follow_up_anxiety_m)$n_session
+term_anxiety
+
+# create data with breaks (based on DASS anxiety severity levels; requires multiplying data by 2)
+data_breaks_anxiety <- data.frame(start = c(0, 8, 10, 15, 20),  
+                          end = c(8, 10, 15, 20, 28),
+                          Severity = forcats::fct_inorder(c("normal", "mild", "moderate", "severe", "extremely severe")))
+# print data with breaks
+data_breaks_anxiety                                    
+
+
+# final plot
+DASS_p2 <- ggplot(term_anxiety) +                                                                      
+  geom_rect(data = data_breaks_anxiety,                                                 # Add background colors to plot
+            aes(xmin = 0, 
+                xmax = 67,
+                ymin = start,
+                ymax = end,
+                fill =  Severity),
+            alpha = 0.5) + 
+  
+  scale_fill_manual(values = c("green", "yellow", "orange", "red", "darkred")) +
+  geom_line(color='black',data = term_anxiety, aes(x=n_session, y=estimate__*2)) +     # predicted line of multiple linear regression
+  geom_ribbon(aes(x=n_session, y=estimate__*2, xmin = 0, xmax= 70, ymin = lower__*2, ymax = upper__*2), alpha = 0.2) +
+  geom_point(data = wide_data, aes(n_session, follow_up_DASS_21_Anxiety *2)) + # follow up scores after the MBSR
+  ggtitle("DASS-21 anxiety") +
+  xlab("Number of practice sessions") +
+  ylab("DASS-21 anxiety follow-up score") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 18), plot.title = element_text(size = 26)) +
+  theme(legend.position="none")
+
+# display the plot
+DASS_p2
+
+ggsave("color_DASS_p2.png", plot = DASS_p2, width = 10, height = 8, dpi = 300) 
+
+```
+
+###### DASS-21 Stress
+```{r, Aim 6: DASS-21 stress}
+
+set.seed(326)
+# Model´s formula
+Follow_up_stress <- bf(follow_up_DASS_21_Stress ~ baseline_DASS_21_Stress + n_session)
+
+## Priors
+priors <- get_prior(Follow_up_stress, family = gaussian(), data=wide_data)
+priors
+
+# Data summary
+mean(wide_data$follow_up_DASS_21_Stress) #5.7
+sd(wide_data$follow_up_DASS_21_Stress) #3.5
+
+# priors on a normal scale (based on the data: mean and sd of the follow-up questionnaire score)
+priorFollow_up_score_stress <- c(
+  prior(normal(5.7, 1),class= Intercept), # sd to cover the whole range of data (1 sd is 3.5 in the data)
+  prior(normal(0, 0.2), class= b),
+  prior(normal(.1, .05), class = sigma) #we intend to explore the difference, no prior expectation
+
+)
+
+
+
+# Prior predictive check
+Follow_up_stress_PriorCheck_m <- brm(
+  formula = Follow_up_stress,
+  data = wide_data,                        
+  family = gaussian(),                     
+  prior = priorFollow_up_score_stress,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+plot37 <- pp_check(Follow_up_stress_PriorCheck_m, nsamples = 100) + ggtitle("follow-up DASS-21 Stress ~ baseline DASS-21 Stress + n_session,
+Prior predictive check") + theme_classic()
+# display the plot
+pp_check(Follow_up_stress_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_stress_PriorCheck_m)
+ggsave("plot37.png", plot = plot37, width = 10, height = 8, dpi = 300) 
+plot37
+
+# Fitting the model
+Follow_up_stress_m <- brm(
+  formula = Follow_up_stress,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_stress,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+plot38 <- pp_check(Follow_up_stress_m, nsamples = 100) + ggtitle("follow-up DASS-21 Stress ~ baseline DASS-21 Stress + n_session,
+Posterior predictive check") + theme_classic()
+# display the plot
+pp_check(Follow_up_stress_m, nsamples = 100, type = "stat")
+summary(Follow_up_stress_m)
+ggsave("plot38.png", plot = plot38, width = 10, height = 8, dpi = 300) 
+
+
+
+# Validity check
+
+# Chain check
+library(bayesplot)
+plot39 <- mcmc_trace(Follow_up_stress_m) + ggtitle("follow-up DASS-21 stress ~ baseline DASS-21 stress + n_session, MCMC trace plot") + theme_classic()
+plot(Follow_up_stress_m)
+ggsave("plot39.png", plot = plot39, width = 10, height = 8, dpi = 300) 
+
+
+
+# Hypothesis testing
+hypothesis(Follow_up_stress_m, "n_session < 0") 
+plot40 <- plot(hypothesis(Follow_up_stress_m, "n_session < 0"))[[1]] + ggtitle("Hypothesis testing: the effect of home-practiced number of sessions
+on stress level is negative") + theme_classic() 
+ggsave("plot40.png", plot = plot40, width = 10, height = 8, dpi = 300) 
+
+
+
+########### PLOTING ########### 
+
+# Plot with colored background
+
+# extract the data from the conditional_effects object
+term_stress <-  conditional_effects(Follow_up_stress_m)$n_session
+term_stress
+
+# create data with breaks (based on DASS stress severity levels; requires multiplying data by 2)
+data_breaks_stress <- data.frame(start = c(0, 15, 19, 26,34),  
+                          end = c(15, 19, 26, 34, 38),
+                          Severity = forcats::fct_inorder(c("normal", "mild", "moderate", "severe", "extremely severe")))
+# print data with breaks
+data_breaks_stress                                      
+
+
+# final plot
+DASS_p1 <- ggplot(term_stress) +                                                                      
+  geom_rect(data = data_breaks_stress,                                                 # Add background colors to plot
+            aes(xmin = 0, 
+                xmax = 67,
+                ymin = start,
+                ymax = end,
+                fill =  Severity),
+            alpha = 0.5) + 
+  
+  scale_fill_manual(values = c("green", "yellow", "orange", "red", "darkred")) +
+  geom_line(color='black',data = term_stress, aes(x=n_session, y=estimate__*2)) +     # predicted line of multiple linear regression
+  geom_ribbon(aes(x=n_session, y=estimate__*2, xmin = 0, xmax= 70, ymin = lower__*2, ymax = upper__*2), alpha = 0.2) +
+  geom_point(data = wide_data, aes(n_session, follow_up_DASS_21_Stress *2)) + # follow up scores after the MBSR
+  ggtitle("DASS-21 stress") +
+  xlab("Number of practice sessions") +
+  ylab("DASS-21 stress follow-up score") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 18), plot.title = element_text(size = 26)) +
+  theme(legend.position="none")
+
+# display the plot
+DASS_p1 
+
+ggsave("color_DASS_p1.png", plot = DASS_p1, width = 10, height = 8, dpi = 300) 
+
+```
+
+###### SF-12 Mental
+```{r, Aim 6: SF-12 mental}
+
+set.seed(204)
+# Model´s formula
+Follow_up_SF_12_Ment <- bf(follow_up_SF_12_Mental ~ baseline_SF_12_Mental + n_session)
+
+
+# Priors
+priorFollow_up_score_SF_12_Ment <- c(
+  prior(normal(46, 0.8),class= Intercept),
+  prior(normal(0, .2), class= b), #we intend to explore the difference, no prior expectation
+  prior(normal(0.6, 0.5), class = sigma)
+)
+
+
+
+# Data summary
+sd(wide_data$follow_up_SF_12_Mental) # 9.5
+mean(wide_data$follow_up_SF_12_Mental) #46.0
+
+
+# Prior predictive check
+Follow_up_SF_12_Ment_PriorCheck_m <- brm(
+  formula = Follow_up_SF_12_Ment,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_SF_12_Ment,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+SF_12_M_prior_plot <- pp_check(Follow_up_SF_12_Ment_PriorCheck_m, nsamples = 100) + ggtitle("follow up SF-12 Mental ~ baseline SF-12 Mental + n_session, 
+Prior predictive check")
+SF_12_M_prior_plot
+
+pp_check(Follow_up_SF_12_Ment_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_SF_12_Ment_PriorCheck_m)
+
+
+# Fitting the model
+Follow_up_SF_12_Ment_m <- brm(
+  formula = Follow_up_SF_12_Ment,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_score_SF_12_Ment,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+SF_12_M_post_plot <- pp_check(Follow_up_SF_12_Ment_m, nsamples = 100) + ggtitle("follow up SF-12 Mental ~ baseline SF-12 Mental + n_session,
+Posterior predictive check")
+SF_12_M_post_plot
+
+pp_check(Follow_up_SF_12_Ment_m, nsamples = 100, type = "stat")
+summary(Follow_up_SF_12_Ment_m)
+
+
+# Validity check
+
+# Chain check
+library(bayesplot)
+SF_12_M_mcmc_plot <- mcmc_trace(Follow_up_SF_12_Ment_m) + ggtitle("follow up SF-12 Mental ~ baseline SF-12 Mental + n_session, 
+MCMC trace plot")
+SF_12_M_mcmc_plot
+plot(Follow_up_SF_12_Ment_m)
+
+
+# Hypothesis testing
+hypothesis(Follow_up_SF_12_Ment_m, "n_session > 0") 
+SF_12_M_Hplot <- plot(hypothesis(Follow_up_SF_12_Ment_m, "n_session > 0"))[[1]] + ggtitle("Hypothesis testing: the effect of practiced number of sessions
+on SF-12 Mental scores is positive") + theme_classic()
+SF_12_M_Hplot
+
+
+# Conditional effects (Ce)
+SF12_Ment_ce <- conditional_effects(Follow_up_SF_12_Ment_m)
+# Plotting Ce with data point
+plot(SF12_Ment_ce, points = T)[[2]] + labs(title = "follow up SF-12 Mental ~ baseline SF-12 Mental + n_session") + theme_classic()
+
+# Plotting Ce without data points
+SF12_p2 <- plot(SF12_Ment_ce)[[2]] + labs(title = "SF-12 Mental",
+                                       x = "Average number of practice sessions",
+                                       y = "SF-12 Mental Score") +                                                                                            theme_classic() +
+                                       geom_line(color = "black")
+
+# Displaying the plot
+SF12_p2
+
+
+
+
+
+
+```
+
+###### SF-12 Physical
+```{r, Aim 6: SF-12 physical}
+
+set.seed(789)
+# Model´s formula
+Follow_up_SF_12_Phys <- bf(follow_up_SF_12_Physical ~ baseline_SF_12_Physical + n_session)
+
+# Priors
+priorFollow_up_SF_12_Phys <- c(
+  prior(normal(52, 0.8),class= Intercept),
+  prior(normal(0, .2), class= b), #we intend to explore the difference, no prior expectation
+  prior(normal(.2, .1), class = sigma)
+)
+
+
+# Data summary
+sd(wide_data$follow_up_SF_12_Physical) # 6.6
+mean(wide_data$follow_up_SF_12_Physical) # 52.31
+
+
+# Prior predictive check
+Follow_up_SF_12_Phys_PriorCheck_m <- brm(
+  formula = Follow_up_SF_12_Phys,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_SF_12_Phys,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  #iter=1000
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+SF_12_P_prior_plot <- pp_check(Follow_up_SF_12_Phys_PriorCheck_m, nsamples = 100) + ggtitle("follow up SF-12 Physical ~ baseline SF-12 Physical + n_session, 
+Prior predictive check")
+SF_12_P_prior_plot
+
+pp_check(Follow_up_SF_12_Phys_PriorCheck_m, nsamples = 100, type = "stat")
+summary(Follow_up_SF_12_Phys_PriorCheck_m)
+
+# Fitting the model
+Follow_up_SF_12_Phys_m <- brm(
+  formula = Follow_up_SF_12_Phys,
+  data = wide_data,
+  family = gaussian(),
+  prior = priorFollow_up_SF_12_Phys,
+  sample_prior = T,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  #warmup = 1000,
+  control = list(max_treedepth = 10, adapt_delta = 0.8)
+)
+
+
+# Posterior predictive check
+SF_12_P_post_plot <- pp_check(Follow_up_SF_12_Phys_m, nsamples = 100) + ggtitle("follow up SF-12 Physical ~ baseline SF-12 Physical + n_session,
+Posterior predictive check")
+SF_12_P_post_plot 
+
+pp_check(Follow_up_SF_12_Phys_m, nsamples = 100, type = "stat")
+summary(Follow_up_SF_12_Phys_m)
+
+
+
+#Validity check
+
+# Chain check
+library(bayesplot)
+SF_12_P_mcmc_plot  <- mcmc_trace(Follow_up_SF_12_Phys_m) + ggtitle("follow up SF-12 Physical ~ baseline SF-12 Physical + n_session, 
+MCMC trace plot")
+SF_12_P_mcmc_plot
+
+plot(Follow_up_SF_12_Phys_m)
+
+# Hypothesis testing
+hypothesis(Follow_up_SF_12_Phys_m, "n_session > 0") 
+SF_12_P_Hplot <- plot(hypothesis(Follow_up_SF_12_Phys_m, "n_session > 0"))[[1]] + ggtitle("Hypothesis testing: the effect of practiced number of sessions
+on SF-12 Physical scores is positive") + theme_classic()
+SF_12_P_Hplot
+
+# Conditional effects (Ce)
+SF12_Phys_ce <- conditional_effects(Follow_up_SF_12_Phys_m)
+
+# Plotting Ce with data point
+plot(SF12_Phys_ce, points = T)[[2]] + labs(title = "follow up SF-12 Physical ~ baseline SF-12 Physical + n_session") + theme_classic()
+
+
+# Plotting Ce without data points
+SF12_p1 <- plot(SF12_Phys_ce)[[2]] + labs(title = "SF-12 Physical",
+                                       x = "Average number of practice sessions",
+                                       y = "SF-12 Physical Score") +                                                                               theme_classic() +
+                                       geom_line(color = "black")
+
+# Displaying the plot
+SF12_p1
+
+# geom_line(color='black',data = term_depression, aes(x=n_session, y=estimate__*2)) +     # predicted line of multiple linear regression
+#   geom_ribbon(aes(x=n_session, y=estimate__*2, xmin = 0, xmax= 70, ymin = lower__*2, ymax = upper__*2), alpha = 0.2) +
+
+
+
+```
+
+
+###### Grid plots
+```{r, Aim 6: grid plots}
+
+
+# Adjust individual plots to add margins
+DASS_p3 <- DASS_p3 + theme(plot.margin = margin(10, 10, 10, 10, "mm"))   
+DASS_p2 <- DASS_p2 + theme(plot.margin = margin(10, 10, 10, 10, "mm"))  
+DASS_p1 <- DASS_p1 + theme(plot.margin = margin(10, 10, 10, 10, "mm")) 
+
+# Adjusting legend size
+DASS_p3 <- DASS_p3 + theme(
+    legend.text = element_text(size = 20),  # Adjust the legend text size
+    legend.title = element_text(size = 32)  # Adjust the legend title size
+)
+
+
+# DASS
+DASS_color_grid <- ggarrange(DASS_p3, DASS_p2, DASS_p1,
+          labels = c("A", "B", "C"),
+          ncol = 3,
+          nrow = 1,
+          common.legend = TRUE, # Use a common legend
+          legend = "bottom",
+           font.label = list(size = 35)
+                             #face = "bold")
+         )
+
+
+DASS_color_grid
+ggsave("DASS_color_grid_sev.png", plot = DASS_color_grid, width = 24, height = 8, dpi = 300) 
+
+
+
+# SF-12 conditional effects Grid plot)
+SF_grid_AIM6 <- ggarrange(SF12_p1, SF12_p2,
+          labels = c("A", "B"),
+          ncol = 2,
+          nrow = 1
+         )
+
+ggsave("SF_grid_AIM6.png", plot = SF_grid_AIM6, width = 14, height = 8, dpi = 300) 
+
+
+```
+
+
+
